@@ -1,0 +1,56 @@
+# --- Project-specific: local-only context, not for public repo ---
+AGENT.md
+agent_notes/
+docs/2.1 Background.txt
+
+# --- Data (large, redistributed by organizers — not for version control) ---
+workspace/data/
+
+# --- Generated outputs (keep the directory, ignore its contents) ---
+logs/*
+!logs/.gitkeep
+submission/*
+!submission/.gitkeep
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+.venv/
+venv/
+env/
+ENV/
+
+# --- Jupyter ---
+.ipynb_checkpoints/
+
+# --- Model checkpoints / weights ---
+*.pt
+*.pth
+*.ckpt
+*.h5
+*.bin
+
+# --- Env / secrets ---
+.env
+.env.*
+*.key
+
+# --- OS / download artifacts ---
+.DS_Store
+Thumbs.db
+*:Zone.Identifier
+
+# --- Editor ---
+.vscode/
+.idea/
+*.swp
+
+# --- Logs ---
+*.log
