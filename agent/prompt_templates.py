@@ -33,6 +33,19 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 _MODEL_ZOO_DIR = _REPO_ROOT / 'workspace' / 'models'
 _MODEL_ZOO_FILES = ('fm.py', 'dcn.py', 'dfm.py', 'afi.py', 'xdfm.py')
 _EDA_SUMMARY_PATH = _REPO_ROOT / 'agent' / 'runs' / 'eda_summary.md'
+_LITERATURE_CONTEXT_PATH = _REPO_ROOT / 'agent' / 'runs' / 'literature_context.md'
+
+
+def _load_literature_context():
+    """Read lazily at prompt-build time, same reasoning as _load_eda_summary below:
+    orchestrator.py generates this file (via rag.py) before the first propose call,
+    but after prompt_templates is imported."""
+    if _LITERATURE_CONTEXT_PATH.exists():
+        text = _LITERATURE_CONTEXT_PATH.read_text(encoding='utf-8').strip()
+        if text:
+            return text
+    return ('(no literature retrieved -- run `python agent/rag.py` first, or it runs '
+            'automatically before the first propose call in orchestrator.py.)')
 
 
 def _load_eda_summary():
@@ -86,7 +99,10 @@ is_hate, is_profile_enter. These are recorded concurrently with the row's own la
 wouldn't be known yet at serving time in a real system — using them directly is a label leak, \
 not a real feature. An *aggregated historical* version of one of these (e.g. a user's \
 long_view rate over their own prior rows, computed so it never looks at the current row) is \
-fine and is a legitimate feature-axis idea."""
+fine and is a legitimate feature-axis idea.
+- If a retrieved literature note below directly informed your hypothesis, name the method \
+(e.g. "per ESMM...") in the HYPOTHESIS line — this is tracked for the project's write-up. \
+Don't force a citation where none applies; a hypothesis with no literature basis is fine too."""
 
 _OUTPUT_FORMAT = """Output format, exactly:
 
@@ -200,9 +216,14 @@ def build_propose_prompt(axis, best_code, history, best_primary):
     hist_txt = _format_history(history)
     axis_label = AXES[axis]['label']
     eda_txt = _load_eda_summary()
+    lit_txt = _load_literature_context()
     return f"""Data facts from EDA (computed once, directly from the real CSVs -- treat as ground \
 truth, not something to re-derive from common sense):
 {eda_txt}
+
+Relevant published methods (retrieved from a small curated corpus, selected based on the EDA \
+findings above -- not an exhaustive literature review, just what's most likely relevant here):
+{lit_txt}
 
 Current best validation primary metric on the {axis_label} axis: {best_primary:.4f}
 

@@ -37,6 +37,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import eda
 import llm
 import prompt_templates as pt
+import rag
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 WORKSPACE = REPO_ROOT / 'workspace'
@@ -63,6 +64,22 @@ def ensure_eda(args):
     eda.run(args.data_dir, model=args.model, max_budget_usd=args.max_budget_usd,
             skip_llm=args.skip_eda_llm)
     print(f'  EDA done in {time.time() - t0:.0f}s')
+
+
+def ensure_literature(args):
+    """Runs the local BM25 retrieval pass (agent/rag.py) over agent/literature/ if
+    its output isn't on disk yet, or --regen_eda was passed (the retrieval query is
+    derived from eda_report.json, so it's naturally tied to the same regen flag --
+    no separate --regen_literature). No LLM call and no network access here: pure
+    local scoring over the pre-curated corpus. Must run after ensure_eda (needs
+    eda_report.json) and before the first propose call."""
+    if rag.CONTEXT_PATH.exists() and not args.regen_eda:
+        print(f'=== Literature: reusing existing retrieval in {rag.RUNS_DIR} ===')
+        return
+    print('=== Literature: retrieving relevant corpus notes (one-time, local BM25) ===')
+    t0 = time.time()
+    rag.run()
+    print(f'  literature retrieval done in {time.time() - t0:.0f}s')
 
 
 def ensure_axis_dirs():
@@ -337,6 +354,7 @@ def main():
     args = ap.parse_args()
 
     ensure_eda(args)
+    ensure_literature(args)
     best_dirs = ensure_axis_dirs()
 
     print('=== node 0: reproducing baseline ===')
