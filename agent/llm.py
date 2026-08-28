@@ -8,6 +8,7 @@ import json
 import os
 import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 
 DEFAULT_MODEL = 'sonnet'
@@ -53,20 +54,36 @@ def call_claude(system_prompt, user_prompt, model=DEFAULT_MODEL,
     if not CLAUDE_BIN:
         return {'ok': False, 'error': 'could not locate a runnable claude executable — '
                                        'is Claude Code installed and on PATH?'}
-    cmd = [
-        CLAUDE_BIN, '-p', user_prompt,
-        '--output-format', 'json',
-        '--tools', '',
-        '--model', model,
-        '--max-budget-usd', str(max_budget_usd),
-        '--system-prompt', system_prompt,
-        '--no-session-persistence',
-    ]
+
+    # System prompt via --system-prompt-file and user prompt via stdin (rather than
+    # `-p <text>` / `--system-prompt <text>`) because Windows' CreateProcess has a
+    # ~32K-character total command-line limit — large prompts (e.g. the model axis's,
+    # which inlines several hundred lines of reference code) blow past that and fail
+    # with WinError 206 "filename or extension is too long". Neither the system-prompt
+    # file nor stdin has that ceiling.
+    fd, sys_prompt_path = tempfile.mkstemp(suffix='.txt', prefix='claude_sysprompt_')
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
-                               encoding='utf-8', errors='replace')
-    except subprocess.TimeoutExpired:
-        return {'ok': False, 'error': f'llm call timed out after {timeout}s'}
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            f.write(system_prompt)
+        cmd = [
+            CLAUDE_BIN, '-p',
+            '--output-format', 'json',
+            '--tools', '',
+            '--model', model,
+            '--max-budget-usd', str(max_budget_usd),
+            '--system-prompt-file', sys_prompt_path,
+            '--no-session-persistence',
+        ]
+        try:
+            proc = subprocess.run(cmd, input=user_prompt, capture_output=True, text=True,
+                                   timeout=timeout, encoding='utf-8', errors='replace')
+        except subprocess.TimeoutExpired:
+            return {'ok': False, 'error': f'llm call timed out after {timeout}s'}
+    finally:
+        try:
+            os.remove(sys_prompt_path)
+        except OSError:
+            pass
 
     if proc.returncode != 0:
         return {'ok': False, 'error': f'claude CLI exited {proc.returncode}: {proc.stderr[-2000:]}'}

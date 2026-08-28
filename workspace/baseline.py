@@ -97,6 +97,13 @@ def run_fm(splits, k=16, lr=0.001, epochs=40, bs=8192, patience=4, seed=0, verbo
     return {'valid': evaluate(uva, yva, m.predict(Xva)),
             'test':  evaluate(ute, yte, m.predict(Xte))}
 
+def run_model(splits, hparams, seed=0, verbose=True):
+    """Generic entrypoint the harness (run_and_report.py) always calls, regardless
+    of model family. Default: unpack hparams as run_fm's keyword args. A candidate
+    that swaps in a different model should replace this function's body (keep the
+    name/signature) rather than renaming run_fm itself."""
+    return run_fm(splits, seed=seed, verbose=verbose, **hparams)
+
 if __name__ == '__main__':
     ap = argparse.ArgumentParser()
     ap.add_argument('--data_dir', default='./KuaiRand-Pure/data',

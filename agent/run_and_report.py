@@ -1,12 +1,18 @@
 """Fixed execution harness — orchestrator-owned, the LLM never sees or edits this file.
 
-Imports a candidate's data.py + baseline.py as plain modules, runs the FM
-baseline, and writes {'valid': {...}, 'test': {...}} to --out as JSON.
+Imports a candidate's data.py + baseline.py as plain modules, runs the candidate's
+model, and writes {'valid': {...}, 'test': {...}} to --out as JSON.
 
 Contract the orchestrator relies on:
   exit code 0 and a valid --out JSON file  -> success
   non-zero exit (traceback on stderr), or timeout, or missing/invalid --out
                                             -> failure, retry/rollback
+
+Model-family-agnostic on purpose: baseline.py must expose
+`run_model(splits, hparams: dict, seed=0, verbose=True) -> {'valid':..., 'test':...}`.
+hparams is an opaque dict (FM's {k, lr, epochs, bs, patience}, or a different
+model family's own hyperparameter names) so this harness doesn't need to change
+when the candidate swaps model families.
 """
 import argparse
 import json
@@ -31,11 +37,10 @@ def main():
     ap.add_argument('--pinned_dir', required=True, help='dir containing the pinned evaluate.py (not copied/editable)')
     ap.add_argument('--data_dir', required=True, help='KuaiRand-Pure data dir (shared, never copied per-iteration)')
     ap.add_argument('--out', required=True, help='path to write metrics JSON to')
-    ap.add_argument('--k', type=int, default=16)
-    ap.add_argument('--lr', type=float, default=0.001)
-    ap.add_argument('--epochs', type=int, default=40)
+    ap.add_argument('--hparams', required=True, help='JSON dict passed to baseline.run_model')
     ap.add_argument('--seed', type=int, default=0)
     a = ap.parse_args()
+    hparams = json.loads(a.hparams)
 
     # candidate_dir first so its data.py/baseline.py shadow anything of the same
     # name; pinned_dir after, so `import evaluate` still resolves to the real,
@@ -46,7 +51,7 @@ def main():
     import baseline
 
     splits = data.load(a.data_dir)
-    result = baseline.run_fm(splits, k=a.k, lr=a.lr, epochs=a.epochs, seed=a.seed, verbose=False)
+    result = baseline.run_model(splits, hparams=hparams, seed=a.seed, verbose=False)
 
     with open(a.out, 'w', encoding='utf-8') as fh:
         json.dump(to_native(result), fh, indent=2)
