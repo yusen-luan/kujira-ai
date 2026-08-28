@@ -11,6 +11,7 @@ logs/*
 !logs/.gitkeep
 submission/*
 !submission/.gitkeep
+agent/runs/
 
 # --- Python ---
 __pycache__/
