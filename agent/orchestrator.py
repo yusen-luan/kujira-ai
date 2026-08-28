@@ -34,6 +34,7 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import eda
 import llm
 import prompt_templates as pt
 
@@ -45,6 +46,23 @@ RUN_AND_REPORT = Path(__file__).resolve().parent / 'run_and_report.py'
 
 ACCEPT_EPS = 1e-4  # local accept/reject threshold — NOT the official convergence rule
 AXES_ORDER = list(pt.AXES.keys())  # ['feature', 'model']
+
+
+def ensure_eda(args):
+    """Runs the one-time, pinned EDA pass (agent/eda.py) if its outputs aren't on disk
+    yet, or if --regen_eda was passed. Must happen before the first propose call:
+    prompt_templates.py reads eda_summary.md lazily at prompt-build time, so as long as
+    this runs before run_axis_iteration, every propose/synthesis prompt in the run
+    picks up real data-grounded facts instead of the "no EDA report found" fallback."""
+    have_both = eda.REPORT_PATH.exists() and eda.SUMMARY_PATH.exists()
+    if have_both and not args.regen_eda:
+        print(f'=== EDA: reusing existing report/summary in {eda.RUNS_DIR} ===')
+        return
+    print('=== EDA: computing data report (one-time) ===')
+    t0 = time.time()
+    eda.run(args.data_dir, model=args.model, max_budget_usd=args.max_budget_usd,
+            skip_llm=args.skip_eda_llm)
+    print(f'  EDA done in {time.time() - t0:.0f}s')
 
 
 def ensure_axis_dirs():
@@ -312,8 +330,13 @@ def main():
     ap.add_argument('--lr', type=float, default=0.001)
     ap.add_argument('--epochs', type=int, default=40)
     ap.add_argument('--seed', type=int, default=0)
+    ap.add_argument('--regen_eda', action='store_true',
+                     help='recompute the EDA report/summary even if already on disk')
+    ap.add_argument('--skip_eda_llm', action='store_true',
+                     help='compute the EDA report but skip the LLM summarization call (no cost)')
     args = ap.parse_args()
 
+    ensure_eda(args)
     best_dirs = ensure_axis_dirs()
 
     print('=== node 0: reproducing baseline ===')

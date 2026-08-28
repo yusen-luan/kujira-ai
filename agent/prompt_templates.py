@@ -32,6 +32,21 @@ ALLOWED_FILES = ('data.py', 'baseline.py')
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _MODEL_ZOO_DIR = _REPO_ROOT / 'workspace' / 'models'
 _MODEL_ZOO_FILES = ('fm.py', 'dcn.py', 'dfm.py', 'afi.py', 'xdfm.py')
+_EDA_SUMMARY_PATH = _REPO_ROOT / 'agent' / 'runs' / 'eda_summary.md'
+
+
+def _load_eda_summary():
+    """Read at prompt-build time (not import time): orchestrator.py generates this
+    file via eda.py before the first propose call in a run, but prompt_templates is
+    imported earlier than that, so baking this into a module-level constant would
+    freeze in whatever was on disk at import -- usually nothing yet."""
+    if _EDA_SUMMARY_PATH.exists():
+        text = _EDA_SUMMARY_PATH.read_text(encoding='utf-8').strip()
+        if text:
+            return text
+    return ('(no EDA report found -- run `python agent/eda.py` first. Proceeding '
+            'without data-grounded facts; treat any assumption about class balance, '
+            'cardinality, or missing-value handling as unverified.)')
 
 
 def _load_model_zoo_reference():
@@ -64,7 +79,14 @@ is present.
 - Don't try to change evaluate.py's scoring semantics — you won't be shown that file and \
 can't edit it anyway.
 - Only propose changes to two files: data.py and baseline.py. Anything else you write is \
-ignored."""
+ignored.
+- Never use a same-row post-impression outcome field as a raw input feature: play_time_ms, \
+profile_stay_time, comment_stay_time, is_click, is_like, is_follow, is_comment, is_forward, \
+is_hate, is_profile_enter. These are recorded concurrently with the row's own label and \
+wouldn't be known yet at serving time in a real system — using them directly is a label leak, \
+not a real feature. An *aggregated historical* version of one of these (e.g. a user's \
+long_view rate over their own prior rows, computed so it never looks at the current row) is \
+fine and is a legitimate feature-axis idea."""
 
 _OUTPUT_FORMAT = """Output format, exactly:
 
@@ -177,7 +199,12 @@ def _format_history(history):
 def build_propose_prompt(axis, best_code, history, best_primary):
     hist_txt = _format_history(history)
     axis_label = AXES[axis]['label']
-    return f"""Current best validation primary metric on the {axis_label} axis: {best_primary:.4f}
+    eda_txt = _load_eda_summary()
+    return f"""Data facts from EDA (computed once, directly from the real CSVs -- treat as ground \
+truth, not something to re-derive from common sense):
+{eda_txt}
+
+Current best validation primary metric on the {axis_label} axis: {best_primary:.4f}
 
 History of past iterations (all axes, for context — avoid repeating what's already been tried):
 {hist_txt}
@@ -218,7 +245,12 @@ exact format from the system prompt (HYPOTHESIS: line + fenced code block(s)).""
 
 def build_synthesis_prompt(feature_code, feature_hypothesis, model_code, model_hypothesis, history):
     hist_txt = _format_history(history)
-    return f"""History of past iterations:
+    eda_txt = _load_eda_summary()
+    return f"""Data facts from EDA (computed once, directly from the real CSVs -- treat as ground \
+truth, not something to re-derive from common sense):
+{eda_txt}
+
+History of past iterations:
 {hist_txt}
 
 Feature-axis candidate — HYPOTHESIS: {feature_hypothesis}
