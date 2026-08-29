@@ -17,6 +17,7 @@ when the candidate swaps model families.
 import argparse
 import json
 import sys
+import time
 import traceback
 
 
@@ -39,6 +40,9 @@ def main():
     ap.add_argument('--out', required=True, help='path to write metrics JSON to')
     ap.add_argument('--hparams', required=True, help='JSON dict passed to baseline.run_model')
     ap.add_argument('--seed', type=int, default=0)
+    ap.add_argument('--verbose', action='store_true',
+                     help='print data-loading status and pass verbose=True to run_model '
+                          '(per-epoch training progress, if the candidate prints it)')
     a = ap.parse_args()
     hparams = json.loads(a.hparams)
 
@@ -50,8 +54,15 @@ def main():
     import data
     import baseline
 
+    if a.verbose:
+        print(f'  loading data from {a.data_dir} ...', flush=True)
+    t0 = time.time()
     splits = data.load(a.data_dir)
-    result = baseline.run_model(splits, hparams=hparams, seed=a.seed, verbose=False)
+    if a.verbose:
+        counts = ', '.join(f'{k}={len(v)}' for k, v in splits.items())
+        print(f'  loaded ({time.time() - t0:.0f}s): {counts}', flush=True)
+        print('  starting training...', flush=True)
+    result = baseline.run_model(splits, hparams=hparams, seed=a.seed, verbose=a.verbose)
 
     with open(a.out, 'w', encoding='utf-8') as fh:
         json.dump(to_native(result), fh, indent=2)
