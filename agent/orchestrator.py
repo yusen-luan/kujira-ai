@@ -1,57 +1,42 @@
-"""v1 orchestrator: a shallow hypothesis tree branching along fixed axes
-(feature engineering, model/architecture), each explored linearly on its own
-branch, with a final synthesis step to combine both if they both improve on
-the baseline. Error recovery (retry-with-error-feedback, then rollback) is
-unchanged from v0.
+"""v2 orchestrator: a single linear iteration chain (replaces v1's feature/model
+axis-tree). Each iteration looks at the whole current pipeline (data.py +
+baseline.py together) and the LLM itself picks the single highest-leverage
+change to make — a feature, a model/architecture change, or a training/loss
+change — rather than being pre-assigned to one axis. See prompt_templates.py's
+module docstring and agent_notes/orchestrator.md for the full design
+discussion and why v1's axis split was replaced (it had a real bug: the model
+axis never inherited the feature axis's accepted improvements, so every
+model-architecture hypothesis was tested against a strictly worse feature set
+than what was actually available — collapsing to one chain fixes this by
+construction, since there's only ever one current-best state).
 
-Schedule (given --iterations total LLM-proposed iterations):
-    1. Explore: one iteration per axis (feature, then model), each starting
-       from the shared baseline.
-    2. Exploit: remaining budget (minus one reserved slot, if both axes were
-       explored) goes to whichever axis has the better validation primary so
-       far, continuing from that axis's own branch tip.
-    3. Synthesize: the reserved slot. If both axes improved over the
-       baseline, one LLM call combines both branch tips into a single
-       candidate. Otherwise the slot is spent on more exploitation instead.
-
-Reflection + stuck-detection + diagnostic-probe loop (added 2026-08-29):
-    - Every axis propose call now sees its own last iteration's hypothesis,
-      stated expected effect, and actual result, and must write a REFLECTION
-      before proposing the next hypothesis (see prompt_templates.py).
-    - `axis_reject_streak` tracks consecutive rejections/failures per axis
-      during the exploit phase. Once an axis crosses `--stuck_after`, the
-      next node on that axis is spent on `run_diagnosis` instead of a normal
-      propose: a dedicated LLM call classifies the root cause
-      (data_gap / modeling_ceiling / low_diversity / engineering). Only
-      data_gap triggers `run_probe`, which has the LLM write a small
-      read-only numpy computation (agent/eda_probe.py's contract) to answer
-      the specific question the diagnosis raised, executed against the same
-      pre-loaded arrays eda.py's own report uses. Findings accumulate in
-      agent/runs/probe_findings.md and feed every future propose prompt.
-    - Diagnosis/probe nodes are spent from a separate `--diagnosis_budget`
-      reserve, not from `--iterations` — getting stuck and investigating
-      doesn't eat into the normal propose budget.
-    - The official convergence rule (epsilon=`--converge_eps`, N=`--converge_n`
-      consecutive nodes with no improvement) is now tracked globally
-      (`overall_primary_trace`) and stops the run early, independent of
-      `--iterations`.
-
-Live terminal output (added 2026-08-29): see display.py. Every LLM call prints
-before/after (what it's being asked to do, cost, duration, and a preview of
-the parsed response fields); every training/probe subprocess is streamed
-line-by-line live instead of captured silently (see stream_subprocess below);
-a hypothesis tree is reprinted after every node so the branching structure
-and each accept/reject/diagnosis is visible at a glance. --quiet suppresses
-just the per-line subprocess streaming (everything else still prints).
+Per-iteration flow:
+    1. Propose call sees the full current data.py + baseline.py, its own last
+       iteration's outcome (including a parsed training-curve summary, not
+       just the endpoint metrics — see parse_training_curve), EDA facts,
+       literature, and accumulated probe findings. It picks exactly one of:
+         (a) a hypothesis + code change (apply -> run -> accept/reject), or
+         (b) a diagnostic probe question (run a small read-only computation,
+             append the answer to probe_findings.md, no code change this turn).
+    2. A plain consecutive-non-improvement streak drives an explicit "you're
+       plateauing" instruction into the next propose prompt once it crosses
+       --escalate_after — replaces v1's separate diagnosis-classification
+       call with a cheaper in-prompt nudge.
+    3. The official convergence rule (epsilon=--converge_eps, N=--converge_n
+       consecutive nodes with no improvement) stops the run early, same as v1.
+       A single epsilon (--converge_eps) drives both accept/reject and the
+       plateau streak, so the two can't disagree: a node is accepted iff its
+       gain over the current best exceeds converge_eps, and that's exactly
+       the condition that resets the streak from step 2 to 0 -- any accepted
+       node resets it, any rejected node increments it.
 
 Usage:
     python orchestrator.py                       # reproduce baseline, then 4 LLM iterations
     python orchestrator.py --iterations 0         # just reproduce baseline (sanity check)
-    python orchestrator.py --iterations 6 --max_repairs 2
+    python orchestrator.py --iterations 10 --max_repairs 2
 
 State on disk:
-    agent/runs/best_<axis>/   current accepted data.py + baseline.py for that axis's branch
-    agent/runs/best/          overall best (whichever axis, or synthesis, wins) - written at the end
+    agent/runs/best/          current accepted data.py + baseline.py (single chain)
     agent/runs/node_N/        one node's working copy (kept after the run for inspection)
     agent/runs/probe_findings.md  accumulated diagnostic-probe results (deliverable-relevant)
     logs/node_N.json          full record of that node (deliverable #3)
@@ -59,6 +44,7 @@ State on disk:
 import argparse
 import json
 import queue
+import re
 import shutil
 import subprocess
 import sys
@@ -81,16 +67,9 @@ RUN_AND_REPORT = Path(__file__).resolve().parent / 'run_and_report.py'
 EDA_PROBE = Path(__file__).resolve().parent / 'eda_probe.py'
 PROBE_FINDINGS_PATH = RUNS_DIR / 'probe_findings.md'
 
-ACCEPT_EPS = 1e-4  # local accept/reject threshold — NOT the official convergence rule
-AXES_ORDER = list(pt.AXES.keys())  # ['feature', 'model']
 
 
 def ensure_eda(args):
-    """Runs the one-time, pinned EDA pass (agent/eda.py) if its outputs aren't on disk
-    yet, or if --regen_eda was passed. Must happen before the first propose call:
-    prompt_templates.py reads eda_summary.md lazily at prompt-build time, so as long as
-    this runs before run_axis_iteration, every propose/synthesis prompt in the run
-    picks up real data-grounded facts instead of the "no EDA report found" fallback."""
     have_both = eda.REPORT_PATH.exists() and eda.SUMMARY_PATH.exists()
     if have_both and not args.regen_eda:
         display.phase(f'EDA: reusing existing report/summary in {eda.RUNS_DIR}')
@@ -103,12 +82,6 @@ def ensure_eda(args):
 
 
 def ensure_literature(args):
-    """Runs the local BM25 retrieval pass (agent/rag.py) over agent/literature/ if
-    its output isn't on disk yet, or --regen_eda was passed (the retrieval query is
-    derived from eda_report.json, so it's naturally tied to the same regen flag --
-    no separate --regen_literature). No LLM call and no network access here: pure
-    local scoring over the pre-curated corpus. Must run after ensure_eda (needs
-    eda_report.json) and before the first propose call."""
     if rag.CONTEXT_PATH.exists() and not args.regen_eda:
         display.phase(f'Literature: reusing existing retrieval in {rag.RUNS_DIR}')
         return
@@ -118,17 +91,46 @@ def ensure_literature(args):
     display.phase(f'literature retrieval done in {time.time() - t0:.0f}s')
 
 
-def ensure_axis_dirs():
-    dirs = {}
-    for axis in AXES_ORDER:
-        bd = RUNS_DIR / f'best_{axis}'
-        bd.mkdir(parents=True, exist_ok=True)
-        for fname in pt.ALLOWED_FILES:
-            dst = bd / fname
-            if not dst.exists():
-                shutil.copy2(WORKSPACE / fname, dst)
-        dirs[axis] = bd
-    return dirs
+def ensure_best_dir():
+    bd = RUNS_DIR / 'best'
+    bd.mkdir(parents=True, exist_ok=True)
+    for fname in pt.ALLOWED_FILES:
+        dst = bd / fname
+        if not dst.exists():
+            shutil.copy2(WORKSPACE / fname, dst)
+    return bd
+
+
+def reset_best_dir():
+    """--no-resume: discard any previously-accepted code changes and start this run's
+    chain from workspace/'s original data.py + baseline.py, same as a first-ever run."""
+    bd = RUNS_DIR / 'best'
+    bd.mkdir(parents=True, exist_ok=True)
+    for fname in pt.ALLOWED_FILES:
+        shutil.copy2(WORKSPACE / fname, bd / fname)
+    return bd
+
+
+def node0_label(best_dir):
+    """node 0 always just re-runs whatever's in best_dir -- with --resume (the default),
+    that's the prior session's already-accepted state if one exists, not necessarily
+    workspace/'s pristine files. Calling that 'baseline' is misleading (it isn't the
+    organizer's reference once anything's been accepted), so compare contents and pick
+    the right label rather than hardcoding 'baseline'."""
+    is_pristine = all((best_dir / f).read_text(encoding='utf-8') == (WORKSPACE / f).read_text(encoding='utf-8')
+                       for f in pt.ALLOWED_FILES)
+    return 'baseline' if is_pristine else 'last best'
+
+
+def clear_prior_logs():
+    """--no-resume: remove prior logs/node_N.json (N>=1) so this run's log directory
+    only ever reflects this run -- otherwise a short fresh run would leave a longer
+    prior run's higher-numbered node logs behind, stale and orphaned."""
+    if not LOGS_DIR.exists():
+        return
+    for path in LOGS_DIR.glob('node_*.json'):
+        if int(path.stem.split('_', 1)[1]) >= 1:
+            path.unlink()
 
 
 def read_code(dir_path):
@@ -170,9 +172,9 @@ def _pump_stream(pipe, q):
 def stream_subprocess(cmd, timeout):
     """Runs cmd, streaming each stdout+stderr line live via display.run_line as it's
     produced, and enforcing timeout with real wall-clock granularity (checked every
-    ~1s) even if the child produces no output at all (a hang, not just a slow print).
-    `-u` on the child's own invocation (see callers) keeps Python's stdout
-    line-buffered so lines actually arrive as they're printed, not in bursts.
+    ~1s) even if the child produces no output at all. `-u` on the child's own
+    invocation (see callers) keeps Python's stdout line-buffered so lines actually
+    arrive as they're printed, not in bursts.
     Returns (returncode_or_None, combined_output_text, timed_out: bool)."""
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                              text=True, encoding='utf-8', errors='replace', bufsize=1)
@@ -193,7 +195,7 @@ def stream_subprocess(cmd, timeout):
         except queue.Empty:
             continue
         if line is None:
-            break  # child closed stdout -- it has exited or is about to
+            break
         lines.append(line)
         display.run_line(line.rstrip('\n'))
 
@@ -207,6 +209,37 @@ def stream_subprocess(cmd, timeout):
 
     proc.wait()
     return proc.returncode, ''.join(lines), False
+
+
+_EPOCH_LINE_RE = re.compile(
+    r"epoch\s*(\d+)\s*\|\s*loss\s*([\d.]+)\s*\|\s*valid GAUC\s*([\d.]+)\s*nDCG@5\s*([\d.]+)\s*primary\s*([\d.]+)")
+_EARLY_STOP_RE = re.compile(r"early stop at epoch\s*(\d+)")
+
+
+def parse_training_curve(output_text):
+    """Extracts a compact training-curve summary from a candidate's captured stdout
+    (the per-epoch lines the CONTRACT asks every candidate to print under
+    verbose=True). Returns None if no epoch lines were found (e.g. run_pop/
+    run_random, or a candidate that doesn't print per-epoch progress). This is what
+    lets the *next* iteration's REFLECTION actually diagnose overfitting/underfitting
+    instead of only seeing the endpoint metrics — see prompt_templates._format_curve."""
+    epochs = []
+    for m in _EPOCH_LINE_RE.finditer(output_text):
+        epochs.append({'epoch': int(m.group(1)), 'loss': float(m.group(2)), 'primary': float(m.group(5))})
+    if not epochs:
+        return None
+    best = max(epochs, key=lambda e: e['primary'])
+    last = epochs[-1]
+    early_stopped = bool(_EARLY_STOP_RE.search(output_text))
+    return {
+        'n_epochs_logged': len(epochs),
+        'first_epoch_primary': epochs[0]['primary'],
+        'best_epoch': best['epoch'], 'best_epoch_primary': best['primary'],
+        'last_epoch': last['epoch'], 'last_epoch_primary': last['primary'],
+        'early_stopped': early_stopped,
+        'degraded_after_best': last['epoch'] > best['epoch'] and last['primary'] < best['primary'] - 1e-4,
+        'still_improving_at_cutoff': (not early_stopped) and last['epoch'] == best['epoch'],
+    }
 
 
 def run_candidate(candidate_dir, data_dir, out_path, hparams, seed, timeout, verbose=True):
@@ -232,7 +265,7 @@ def run_candidate(candidate_dir, data_dir, out_path, hparams, seed, timeout, ver
         metrics = json.loads(out_path.read_text(encoding='utf-8'))
     except json.JSONDecodeError:
         return {'ok': False, 'timed_out': False, 'error': 'metrics.json was not valid JSON'}
-    return {'ok': True, 'metrics': metrics}
+    return {'ok': True, 'metrics': metrics, 'training_curve': parse_training_curve(output)}
 
 
 def run_probe_candidate(probe_dir, data_dir, out_path, timeout):
@@ -274,19 +307,60 @@ def write_log(node_id, record):
     (LOGS_DIR / f'node_{node_id}.json').write_text(json.dumps(record, indent=2), encoding='utf-8')
 
 
-def timeout_for(axis, args):
-    return args.model_run_timeout if axis == 'model' else args.run_timeout
+def load_prior_history():
+    """Replays every node_*.json already on disk from a previous run into the same
+    entry shape run_iteration() returns, so a fresh run's very first propose prompt
+    already has the full "History of past iterations" and last-iteration reflection
+    -- otherwise each run starts amnesiac and can re-propose something already tried
+    and rejected. Returns (history_entries_oldest_first, highest_node_id_seen), the
+    latter used so this run's node ids continue on rather than overwriting the prior
+    run's logs/node_N.json files."""
+    entries = []
+    max_node = 0
+    if not LOGS_DIR.exists():
+        return entries, max_node
+    paths = sorted(LOGS_DIR.glob('node_*.json'),
+                    key=lambda p: int(p.stem.split('_', 1)[1]))
+    for path in paths:
+        node_num = int(path.stem.split('_', 1)[1])
+        max_node = max(max_node, node_num)
+        if node_num == 0:
+            continue  # baseline reproduction, not an iteration -- re-run fresh each time
+        try:
+            record = json.loads(path.read_text(encoding='utf-8'))
+        except (json.JSONDecodeError, OSError):
+            continue
+        status = record.get('status')
+        entry = {'iter': record.get('iter', node_num), 'status': status}
+        if status in ('accepted', 'rejected'):
+            entry.update(hypothesis=record.get('hypothesis'), reflection=record.get('reflection'),
+                         expected_effect=record.get('expected_effect'), metrics=record.get('metrics'),
+                         prev_metrics=record.get('prev_metrics'), training_curve=record.get('training_curve'),
+                         primary=record.get('new_primary'), prev_best=record.get('prev_best_primary'),
+                         sweep=record.get('sweep'))
+        elif status == 'answered':
+            entry.update(question=record.get('question'), reflection=record.get('reflection'))
+        elif status == 'failed':
+            entry.update(hypothesis=record.get('hypothesis'), question=record.get('question'),
+                         error_summary=record.get('error_summary'))
+        else:
+            continue
+        entries.append(entry)
+    return entries, max_node
 
 
-def run_and_repair(node_id, iter_dir, axis, system_prompt, hypothesis, args, llm_calls):
+def run_and_repair(node_id, iter_dir, hypothesis, args, llm_calls, hparams_override=None):
     """Runs an already-populated candidate dir; on failure, feeds the traceback
-    back to the LLM and retries up to --max_repairs times. Returns (result, run_attempts)."""
+    back to the LLM and retries up to --max_repairs times. Returns (result, run_attempts).
+    hparams_override merges over the base {k, lr, epochs} -- used by run_sweep below to
+    try the first of several hyperparameter values through the normal repair path (a code
+    bug would affect every value identically, so it's only worth debugging once)."""
     metrics_path = iter_dir / 'metrics.json'
-    hparams = {'k': args.k, 'lr': args.lr, 'epochs': args.epochs}
-    timeout = timeout_for(axis, args)
+    hparams = {'k': args.k, 'lr': args.lr, 'epochs': args.epochs, **(hparams_override or {})}
+    timeout = args.run_timeout
 
     run_attempts = []
-    display.run_start(f'{axis} candidate (node {node_id})', timeout)
+    display.run_start(f'candidate (node {node_id})', timeout)
     t0 = time.time()
     result = run_candidate(iter_dir, args.data_dir, metrics_path, hparams, args.seed, timeout,
                             verbose=not args.quiet)
@@ -297,8 +371,8 @@ def run_and_repair(node_id, iter_dir, axis, system_prompt, hypothesis, args, llm
     while not result['ok'] and repairs_left > 0:
         repairs_left -= 1
         repair_prompt = pt.build_repair_prompt(read_code(iter_dir), hypothesis, result['error'])
-        attempt, tries = call_llm_with_retry(system_prompt, repair_prompt, args.model, args.max_budget_usd,
-                                              label=f'repairing {axis} candidate after run failure '
+        attempt, tries = call_llm_with_retry(pt.SYSTEM_PROMPT, repair_prompt, args.model, args.max_budget_usd,
+                                              label=f'repairing candidate after run failure '
                                                     f'({repairs_left + 1} attempt(s) left)')
         llm_calls.extend({'cost_usd': t.get('cost_usd'), 'ok': t['ok'], 'error': t.get('error')} for t in tries)
         if not attempt['ok']:
@@ -307,13 +381,48 @@ def run_and_repair(node_id, iter_dir, axis, system_prompt, hypothesis, args, llm
             break
         repaired_files = pt.parse_response(attempt['text'])['files']
         apply_files(iter_dir, repaired_files)
-        display.run_start(f'{axis} candidate (node {node_id}, repaired)', timeout)
+        display.run_start(f'candidate (node {node_id}, repaired)', timeout)
         t0 = time.time()
         result = run_candidate(iter_dir, args.data_dir, metrics_path, hparams, args.seed, timeout,
                                 verbose=not args.quiet)
         display.run_end(t0, result['ok'], timed_out=result.get('timed_out', False))
         run_attempts.append({'attempt': len(run_attempts), 'ok': result['ok'], 'error': result.get('error')})
     return result, run_attempts
+
+
+def run_sweep(node_id, iter_dir, hypothesis, args, llm_calls, sweep_param, sweep_values):
+    """One node, several hparams values of the same code -- avoids spending a full extra
+    LLM round-trip (and a full extra logged/attributed node) per value the way separate
+    hypothesis turns would. The first value gets the normal run_and_repair treatment (so a
+    real code bug still gets fixed); later values that fail (e.g. a larger width OOMs or
+    times out) are just recorded as failed and skipped -- a bad hyperparameter value isn't
+    a code bug worth spending repair budget on. Returns (best_result_or_None, best_value,
+    trials, run_attempts), where best_result is a run_candidate-shaped 'ok' dict (or the
+    first trial's failing result if every value failed) and trials is a list of
+    {'value', 'ok', 'primary', 'error'} for every value tried, in order."""
+    first_result, run_attempts = run_and_repair(node_id, iter_dir, hypothesis, args, llm_calls,
+                                                  hparams_override={sweep_param: sweep_values[0]})
+    trials = [{'value': sweep_values[0], 'ok': first_result['ok'],
+               'primary': first_result['metrics']['valid']['primary'] if first_result['ok'] else None,
+               'error': None if first_result['ok'] else first_result.get('error')}]
+    best_result = first_result if first_result['ok'] else None
+    best_value = sweep_values[0]
+
+    base_hparams = {'k': args.k, 'lr': args.lr, 'epochs': args.epochs}
+    metrics_path = iter_dir / 'metrics.json'
+    for value in sweep_values[1:]:
+        display.run_start(f'candidate (node {node_id}, {sweep_param}={value})', args.run_timeout)
+        t0 = time.time()
+        r = run_candidate(iter_dir, args.data_dir, metrics_path, {**base_hparams, sweep_param: value},
+                           args.seed, args.run_timeout, verbose=not args.quiet)
+        display.run_end(t0, r['ok'], timed_out=r.get('timed_out', False))
+        trials.append({'value': value, 'ok': r['ok'],
+                        'primary': r['metrics']['valid']['primary'] if r['ok'] else None,
+                        'error': None if r['ok'] else r.get('error')})
+        if r['ok'] and (best_result is None or r['metrics']['valid']['primary'] > best_result['metrics']['valid']['primary']):
+            best_result, best_value = r, value
+
+    return best_result if best_result is not None else first_result, best_value, trials, run_attempts
 
 
 def run_probe_and_repair(probe_dir, question, args, llm_calls):
@@ -332,7 +441,7 @@ def run_probe_and_repair(probe_dir, question, args, llm_calls):
         repairs_left -= 1
         current_probe = {'probe.py': (probe_dir / 'probe.py').read_text(encoding='utf-8')}
         repair_prompt = pt.build_repair_prompt(current_probe, question, result['error'])
-        attempt, tries = call_llm_with_retry(pt.PROBE_SYSTEM_PROMPT, repair_prompt, args.model, args.max_budget_usd,
+        attempt, tries = call_llm_with_retry(pt.SYSTEM_PROMPT, repair_prompt, args.model, args.max_budget_usd,
                                               label=f'repairing probe after run failure ({repairs_left + 1} left)')
         llm_calls.extend({'cost_usd': t.get('cost_usd'), 'ok': t['ok'], 'error': t.get('error')} for t in tries)
         if not attempt['ok']:
@@ -351,268 +460,134 @@ def run_probe_and_repair(probe_dir, question, args, llm_calls):
     return result, run_attempts
 
 
-def run_axis_iteration(node_id, axis, best_dir, best_primary, prev_metrics, history, args):
-    """Proposes + evaluates one hypothesis on `axis`'s own branch. Accepts into
-    `best_dir` (in place) on improvement. `prev_metrics` is the full valid/test metrics
-    dict of the state this attempt starts from (baseline, or the axis's last accepted
-    state) -- carried into the history entry so the *next* iteration's reflection can
-    show a real before/after per-metric delta, not just the current absolute numbers.
-    Returns (status, new_best_primary, new_best_metrics, history_entry)."""
+def append_probe_finding(node_id, question, result):
+    PROBE_FINDINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    block = f"### Probe (node {node_id})\nQuestion: {question}\n\n```json\n{json.dumps(result, indent=2)}\n```\n\n"
+    with open(PROBE_FINDINGS_PATH, 'a', encoding='utf-8') as f:
+        f.write(block)
+
+
+def run_iteration(node_id, best_dir, best_primary, prev_metrics, history, args, streak):
+    """One node of the single iteration chain. Proposes; the LLM itself picks a
+    hypothesis+code-change turn or a probe turn. Accepts a hypothesis into `best_dir`
+    (in place) on improvement. Returns (status, new_best_primary, new_best_metrics,
+    history_entry). status is one of accepted/rejected/answered/failed."""
     best_code = read_code(best_dir)
-    system_prompt = pt.AXES[axis]['system_prompt']
-    propose_prompt = pt.build_propose_prompt(axis, best_code, history, best_primary)
+    propose_prompt = pt.build_propose_prompt(best_code, history, best_primary, streak,
+                                              args.escalate_after, args.converge_eps)
     llm_calls = []
 
-    attempt, tries = call_llm_with_retry(system_prompt, propose_prompt, args.model, args.max_budget_usd,
-                                          label=f'proposing a hypothesis on the {axis} axis')
+    attempt, tries = call_llm_with_retry(pt.SYSTEM_PROMPT, propose_prompt, args.model, args.max_budget_usd,
+                                          label='deciding the next move (hypothesis or probe)')
     llm_calls.extend({'cost_usd': t.get('cost_usd'), 'ok': t['ok'], 'error': t.get('error')} for t in tries)
     if not attempt['ok']:
-        record = {'iter': node_id, 'axis': axis, 'status': 'failed', 'hypothesis': None,
+        record = {'iter': node_id, 'status': 'failed', 'hypothesis': None,
                    'error_summary': f'LLM propose call failed: {attempt["error"]}',
                    'llm_calls': llm_calls, 'run_attempts': []}
         write_log(node_id, record)
-        return 'failed', best_primary, prev_metrics, {'iter': node_id, 'axis': axis, 'status': 'failed',
+        return 'failed', best_primary, prev_metrics, {'iter': node_id, 'status': 'failed',
                                          'hypothesis': '(propose call failed)', 'error_summary': attempt['error']}
 
     parsed = pt.parse_response(attempt['text'])
-    reflection, hypothesis = parsed['reflection'], parsed['hypothesis']
-    expected_effect, files = parsed['expected_effect'], parsed['files']
+    reflection = parsed['reflection']
     display.field('reflection', reflection)
+
+    if parsed['mode'] == 'probe':
+        question = parsed['probe_question']
+        display.field('probe question', question)
+        probe_files = {k: v for k, v in parsed['files'].items() if k in pt.PROBE_ALLOWED_FILES}
+        if not probe_files:
+            record = {'iter': node_id, 'status': 'failed', 'question': question,
+                       'error_summary': 'no probe.py parsed from LLM response',
+                       'raw_response': attempt['text'][:2000], 'llm_calls': llm_calls}
+            write_log(node_id, record)
+            return 'failed', best_primary, prev_metrics, {'iter': node_id, 'status': 'failed', 'question': question}
+
+        probe_dir = RUNS_DIR / f'node_{node_id}'
+        probe_dir.mkdir(parents=True, exist_ok=True)
+        for fname, content in probe_files.items():
+            (probe_dir / fname).write_text(content, encoding='utf-8')
+
+        result, run_attempts = run_probe_and_repair(probe_dir, question, args, llm_calls)
+        if not result['ok']:
+            record = {'iter': node_id, 'status': 'failed', 'question': question,
+                       'error_summary': result['error'], 'llm_calls': llm_calls, 'run_attempts': run_attempts}
+            write_log(node_id, record)
+            return 'failed', best_primary, prev_metrics, {'iter': node_id, 'status': 'failed', 'question': question}
+
+        display.field('probe result', json.dumps(result['result']))
+        append_probe_finding(node_id, question, result['result'])
+        record = {'iter': node_id, 'status': 'answered', 'question': question, 'reflection': reflection,
+                  'result': result['result'], 'llm_calls': llm_calls, 'run_attempts': run_attempts}
+        write_log(node_id, record)
+        return 'answered', best_primary, prev_metrics, {'iter': node_id, 'status': 'answered',
+                                                          'question': question, 'reflection': reflection}
+
+    # hypothesis mode
+    hypothesis, expected_effect, files = parsed['hypothesis'], parsed['expected_effect'], parsed['files']
+    sweep_param, sweep_values = parsed['sweep_param'], parsed['sweep_values']
     display.field('hypothesis', hypothesis)
     display.field('expected effect', expected_effect)
+    if sweep_param:
+        display.field('sweep', f'{sweep_param} over {sweep_values}')
     changed = [f for f in files if f in pt.ALLOWED_FILES]
     if not changed:
-        record = {'iter': node_id, 'axis': axis, 'status': 'failed', 'hypothesis': hypothesis,
+        record = {'iter': node_id, 'status': 'failed', 'hypothesis': hypothesis,
                    'reflection': reflection, 'expected_effect': expected_effect,
                    'error_summary': 'no valid file changes parsed from LLM response',
                    'raw_response': attempt['text'][:2000], 'llm_calls': llm_calls, 'run_attempts': []}
         write_log(node_id, record)
-        return 'failed', best_primary, prev_metrics, {'iter': node_id, 'axis': axis, 'status': 'failed',
+        return 'failed', best_primary, prev_metrics, {'iter': node_id, 'status': 'failed',
                                          'hypothesis': hypothesis, 'error_summary': 'no file changes proposed'}
 
     iter_dir = snapshot_node_dir(node_id, best_dir)
     apply_files(iter_dir, files)
-    result, run_attempts = run_and_repair(node_id, iter_dir, axis, system_prompt, hypothesis, args, llm_calls)
+    sweep = None
+    if sweep_param:
+        result, best_value, trials, run_attempts = run_sweep(node_id, iter_dir, hypothesis, args, llm_calls,
+                                                               sweep_param, sweep_values)
+        sweep = {'param': sweep_param, 'trials': trials, 'best_value': best_value}
+    else:
+        result, run_attempts = run_and_repair(node_id, iter_dir, hypothesis, args, llm_calls)
 
     if not result['ok']:
-        record = {'iter': node_id, 'axis': axis, 'status': 'failed', 'hypothesis': hypothesis,
+        record = {'iter': node_id, 'status': 'failed', 'hypothesis': hypothesis,
                    'reflection': reflection, 'expected_effect': expected_effect, 'changed_files': changed,
-                   'error_summary': result['error'], 'llm_calls': llm_calls, 'run_attempts': run_attempts}
+                   'sweep': sweep, 'error_summary': result['error'], 'llm_calls': llm_calls,
+                   'run_attempts': run_attempts}
         write_log(node_id, record)
-        return 'failed', best_primary, prev_metrics, {'iter': node_id, 'axis': axis, 'status': 'failed',
+        return 'failed', best_primary, prev_metrics, {'iter': node_id, 'status': 'failed',
                                          'hypothesis': hypothesis, 'error_summary': result['error']}
 
     new_primary = result['metrics']['valid']['primary']
-    if new_primary > best_primary + ACCEPT_EPS:
+    if new_primary > best_primary + args.converge_eps:
         for fname in pt.ALLOWED_FILES:
             shutil.copy2(iter_dir / fname, best_dir / fname)
         status, out_best, out_metrics = 'accepted', new_primary, result['metrics']
     else:
         status, out_best, out_metrics = 'rejected', best_primary, prev_metrics
 
-    record = {'iter': node_id, 'axis': axis, 'status': status, 'hypothesis': hypothesis,
+    record = {'iter': node_id, 'status': status, 'hypothesis': hypothesis,
               'reflection': reflection, 'expected_effect': expected_effect, 'changed_files': changed,
-              'metrics': result['metrics'], 'prev_metrics': prev_metrics,
+              'sweep': sweep, 'metrics': result['metrics'], 'prev_metrics': prev_metrics,
+              'training_curve': result.get('training_curve'),
               'prev_best_primary': best_primary, 'new_primary': new_primary,
               'llm_calls': llm_calls, 'run_attempts': run_attempts}
     write_log(node_id, record)
-    return status, out_best, out_metrics, {'iter': node_id, 'axis': axis, 'status': status, 'hypothesis': hypothesis,
-                               'reflection': reflection, 'expected_effect': expected_effect,
+    return status, out_best, out_metrics, {'iter': node_id, 'status': status, 'hypothesis': hypothesis,
+                               'reflection': reflection, 'expected_effect': expected_effect, 'sweep': sweep,
                                'metrics': result['metrics'], 'prev_metrics': prev_metrics,
+                               'training_curve': result.get('training_curve'),
                                'primary': new_primary, 'prev_best': best_primary}
-
-
-def last_accepted_hypothesis(history, axis):
-    for h in reversed(history):
-        if h.get('axis') == axis and h.get('status') == 'accepted':
-            return h['hypothesis']
-    return '(baseline, no accepted change on this axis)'
-
-
-def axis_reject_streak(history, axis):
-    """Consecutive rejected/failed entries at the tail of `axis`'s own history (an
-    'accepted' entry resets it to 0; diagnosis/probe entries are tagged
-    '<axis>_diagnosis'/'<axis>_probe' so they're skipped here, not counted and not
-    treated as a break)."""
-    streak = 0
-    for h in reversed(history):
-        if h.get('axis') != axis:
-            continue
-        if h.get('status') == 'accepted':
-            break
-        if h.get('status') in ('rejected', 'failed'):
-            streak += 1
-        else:
-            break
-    return streak
-
-
-def check_converged(trace, eps, n):
-    """Official convergence rule: no improvement > eps over the last n nodes."""
-    if len(trace) <= n:
-        return False
-    return (trace[-1] - trace[-1 - n]) <= eps
-
-
-def append_probe_finding(node_id, axis, question, result):
-    PROBE_FINDINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
-    block = (f"### Probe (node {node_id}, {axis} axis)\n"
-             f"Question: {question}\n\n"
-             f"```json\n{json.dumps(result, indent=2)}\n```\n\n")
-    with open(PROBE_FINDINGS_PATH, 'a', encoding='utf-8') as f:
-        f.write(block)
-
-
-def run_diagnosis(node_id, axis, history, args):
-    """Classifies why `axis` has been racking up rejections. Returns
-    (category, rationale, probe_question, history_entry)."""
-    prompt = pt.build_diagnosis_prompt(axis, history)
-    llm_calls = []
-    attempt, tries = call_llm_with_retry(pt.DIAGNOSIS_SYSTEM_PROMPT, prompt, args.model, args.max_budget_usd,
-                                          label=f'diagnosing why the {axis} axis is stuck')
-    llm_calls.extend({'cost_usd': t.get('cost_usd'), 'ok': t['ok'], 'error': t.get('error')} for t in tries)
-
-    diag_axis = f'{axis}_diagnosis'
-    if not attempt['ok']:
-        record = {'iter': node_id, 'axis': diag_axis, 'status': 'failed',
-                   'error_summary': f'LLM diagnosis call failed: {attempt["error"]}', 'llm_calls': llm_calls}
-        write_log(node_id, record)
-        return 'engineering', f'(diagnosis call failed: {attempt["error"]})', '', \
-            {'iter': node_id, 'axis': diag_axis, 'status': 'failed'}
-
-    parsed = pt.parse_diagnosis_response(attempt['text'])
-    display.field('category', parsed['category'])
-    display.field('rationale', parsed['rationale'])
-    display.field('probe question', parsed['probe_question'])
-    record = {'iter': node_id, 'axis': diag_axis, 'status': 'diagnosed', 'category': parsed['category'],
-              'rationale': parsed['rationale'], 'probe_question': parsed['probe_question'],
-              'llm_calls': llm_calls}
-    write_log(node_id, record)
-    entry = {'iter': node_id, 'axis': diag_axis, 'status': 'diagnosed', 'category': parsed['category']}
-    return parsed['category'], parsed['rationale'], parsed['probe_question'], entry
-
-
-def run_probe(node_id, axis, question, args):
-    """Has the LLM write + run a read-only diagnostic probe answering `question`.
-    Appends the result to probe_findings.md on success. Returns a history_entry dict."""
-    probe_axis = f'{axis}_probe'
-    prompt = pt.build_probe_prompt(question, axis)
-    llm_calls = []
-    attempt, tries = call_llm_with_retry(pt.PROBE_SYSTEM_PROMPT, prompt, args.model, args.max_budget_usd,
-                                          label=f'writing a diagnostic probe for the {axis} axis')
-    llm_calls.extend({'cost_usd': t.get('cost_usd'), 'ok': t['ok'], 'error': t.get('error')} for t in tries)
-    if not attempt['ok']:
-        record = {'iter': node_id, 'axis': probe_axis, 'status': 'failed', 'question': question,
-                   'error_summary': f'LLM probe call failed: {attempt["error"]}', 'llm_calls': llm_calls}
-        write_log(node_id, record)
-        return {'iter': node_id, 'axis': probe_axis, 'status': 'failed', 'question': question}
-
-    parsed = pt.parse_response(attempt['text'])
-    files = {k: v for k, v in parsed['files'].items() if k in pt.PROBE_ALLOWED_FILES}
-    if not files:
-        record = {'iter': node_id, 'axis': probe_axis, 'status': 'failed', 'question': question,
-                   'error_summary': 'no probe.py parsed from LLM response',
-                   'raw_response': attempt['text'][:2000], 'llm_calls': llm_calls}
-        write_log(node_id, record)
-        return {'iter': node_id, 'axis': probe_axis, 'status': 'failed', 'question': question}
-
-    probe_dir = RUNS_DIR / f'node_{node_id}'
-    probe_dir.mkdir(parents=True, exist_ok=True)
-    for fname, content in files.items():
-        (probe_dir / fname).write_text(content, encoding='utf-8')
-
-    result, run_attempts = run_probe_and_repair(probe_dir, question, args, llm_calls)
-    if not result['ok']:
-        record = {'iter': node_id, 'axis': probe_axis, 'status': 'failed', 'question': question,
-                   'error_summary': result['error'], 'llm_calls': llm_calls, 'run_attempts': run_attempts}
-        write_log(node_id, record)
-        return {'iter': node_id, 'axis': probe_axis, 'status': 'failed', 'question': question}
-
-    display.field('probe result', json.dumps(result['result']))
-    append_probe_finding(node_id, axis, question, result['result'])
-    record = {'iter': node_id, 'axis': probe_axis, 'status': 'answered', 'question': question,
-              'result': result['result'], 'llm_calls': llm_calls, 'run_attempts': run_attempts}
-    write_log(node_id, record)
-    return {'iter': node_id, 'axis': probe_axis, 'status': 'answered', 'question': question}
-
-
-def run_synthesis(node_id, feature_dir, model_dir, best_primary, history, args):
-    """Combines the feature-axis and model-axis branch tips into one candidate.
-    Returns (status, new_best_primary, history_entry, node_dir)."""
-    feature_code, model_code = read_code(feature_dir), read_code(model_dir)
-    feature_hyp = last_accepted_hypothesis(history, 'feature')
-    model_hyp = last_accepted_hypothesis(history, 'model')
-    system_prompt = pt.SYNTHESIS_SYSTEM_PROMPT
-    prompt = pt.build_synthesis_prompt(feature_code, feature_hyp, model_code, model_hyp, history)
-    llm_calls = []
-
-    attempt, tries = call_llm_with_retry(system_prompt, prompt, args.model, args.max_budget_usd,
-                                          label='synthesizing the feature-axis + model-axis candidates')
-    llm_calls.extend({'cost_usd': t.get('cost_usd'), 'ok': t['ok'], 'error': t.get('error')} for t in tries)
-    if not attempt['ok']:
-        record = {'iter': node_id, 'axis': 'synthesis', 'status': 'failed', 'hypothesis': None,
-                   'error_summary': f'LLM synthesis call failed: {attempt["error"]}',
-                   'llm_calls': llm_calls, 'run_attempts': []}
-        write_log(node_id, record)
-        return ('failed', best_primary, {'iter': node_id, 'axis': 'synthesis', 'status': 'failed',
-                 'hypothesis': '(synthesis call failed)', 'error_summary': attempt['error']}, None)
-
-    parsed = pt.parse_response(attempt['text'])
-    hypothesis, files = parsed['hypothesis'], parsed['files']
-    display.field('hypothesis', hypothesis)
-    changed = [f for f in files if f in pt.ALLOWED_FILES]
-
-    node_dir = RUNS_DIR / f'node_{node_id}'
-    if node_dir.exists():
-        shutil.rmtree(node_dir)
-    node_dir.mkdir(parents=True)
-    # Seed with feature axis's data.py + model axis's baseline.py as the fallback for
-    # whichever file the LLM doesn't rewrite (it's told to output full files for both
-    # when merging, but this keeps a sane default if it only touches one).
-    shutil.copy2(feature_dir / 'data.py', node_dir / 'data.py')
-    shutil.copy2(model_dir / 'baseline.py', node_dir / 'baseline.py')
-
-    if not changed:
-        record = {'iter': node_id, 'axis': 'synthesis', 'status': 'failed', 'hypothesis': hypothesis,
-                   'error_summary': 'no valid file changes parsed from LLM response',
-                   'raw_response': attempt['text'][:2000], 'llm_calls': llm_calls, 'run_attempts': []}
-        write_log(node_id, record)
-        return ('failed', best_primary, {'iter': node_id, 'axis': 'synthesis', 'status': 'failed',
-                 'hypothesis': hypothesis, 'error_summary': 'no file changes proposed'}, None)
-
-    apply_files(node_dir, files)
-    result, run_attempts = run_and_repair(node_id, node_dir, 'synthesis', system_prompt, hypothesis, args, llm_calls)
-
-    if not result['ok']:
-        record = {'iter': node_id, 'axis': 'synthesis', 'status': 'failed', 'hypothesis': hypothesis,
-                   'changed_files': changed, 'error_summary': result['error'],
-                   'llm_calls': llm_calls, 'run_attempts': run_attempts}
-        write_log(node_id, record)
-        return ('failed', best_primary, {'iter': node_id, 'axis': 'synthesis', 'status': 'failed',
-                 'hypothesis': hypothesis, 'error_summary': result['error']}, None)
-
-    new_primary = result['metrics']['valid']['primary']
-    accepted = new_primary > best_primary + ACCEPT_EPS
-    status = 'accepted' if accepted else 'rejected'
-    out_best = new_primary if accepted else best_primary
-
-    record = {'iter': node_id, 'axis': 'synthesis', 'status': status, 'hypothesis': hypothesis,
-              'changed_files': changed, 'metrics': result['metrics'], 'prev_best_primary': best_primary,
-              'new_primary': new_primary, 'llm_calls': llm_calls, 'run_attempts': run_attempts}
-    write_log(node_id, record)
-    return (status, out_best, {'iter': node_id, 'axis': 'synthesis', 'status': status, 'hypothesis': hypothesis,
-             'primary': new_primary, 'prev_best': best_primary}, node_dir)
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--data_dir', default=str(WORKSPACE / 'data'))
-    ap.add_argument('--iterations', type=int, default=4,
-                     help='total LLM-proposed iterations across explore/exploit/synthesis')
+    ap.add_argument('--iterations', type=int, default=10, help='max LLM-proposed iterations')
     ap.add_argument('--max_repairs', type=int, default=2, help='error-repair attempts per node')
-    ap.add_argument('--run_timeout', type=int, default=180, help='seconds before a feature-axis run is killed')
-    ap.add_argument('--model_run_timeout', type=int, default=400,
-                     help='seconds before a model-axis (torch, CPU) run is killed')
+    ap.add_argument('--run_timeout', type=int, default=400,
+                     help='seconds before any candidate run is killed (covers both numpy and torch candidates)')
     ap.add_argument('--model', default='sonnet')
     ap.add_argument('--max_budget_usd', type=float, default=0.50)
     ap.add_argument('--k', type=int, default=16)
@@ -623,12 +598,9 @@ def main():
                      help='recompute the EDA report/summary even if already on disk')
     ap.add_argument('--skip_eda_llm', action='store_true',
                      help='compute the EDA report but skip the LLM summarization call (no cost)')
-    ap.add_argument('--stuck_after', type=int, default=2,
-                     help='consecutive rejected/failed iterations on an axis (during exploit) before '
-                          'spending a node on diagnosis instead of another normal propose')
-    ap.add_argument('--diagnosis_budget', type=int, default=2,
-                     help='extra nodes (diagnosis + probe calls) reserved outside --iterations, spent '
-                          'only when an axis actually gets stuck')
+    ap.add_argument('--escalate_after', type=int, default=2,
+                     help='consecutive iterations without a >converge_eps improvement before the '
+                          'prompt explicitly pushes for a structurally different idea (or a probe)')
     ap.add_argument('--probe_timeout', type=int, default=90,
                      help='seconds before a diagnostic probe run is killed')
     ap.add_argument('--converge_eps', type=float, default=0.002,
@@ -636,156 +608,104 @@ def main():
                           'best primary by more than this over --converge_n consecutive nodes')
     ap.add_argument('--converge_n', type=int, default=3,
                      help='official convergence N (see --converge_eps)')
+    ap.add_argument('--early_stop', action=argparse.BooleanOptionalAction, default=True,
+                     help='stop early once the official convergence rule triggers (default); '
+                          '--no-early_stop runs the full --iterations budget regardless, still '
+                          'logging plateau streaks and escalating the propose prompt as usual')
+    ap.add_argument('--resume', action=argparse.BooleanOptionalAction, default=True,
+                     help='start from the current agent/runs/best/ code and prior logs/node_*.json '
+                          'history (default), continuing node numbering so nothing is overwritten; '
+                          '--no-resume starts completely fresh -- resets best/ to workspace/\'s '
+                          'original data.py+baseline.py, clears prior logs/node_N.json (N>=1), '
+                          'and begins node numbering at 1 again')
     ap.add_argument('--quiet', action='store_true',
                      help='suppress live per-line training/probe subprocess output (everything else '
-                          '-- LLM call previews, results, the hypothesis tree -- still prints)')
+                          '-- LLM call previews, results, the run history -- still prints)')
     args = ap.parse_args()
     display.set_quiet(args.quiet)
 
     ensure_eda(args)
     ensure_literature(args)
-    best_dirs = ensure_axis_dirs()
+    if args.resume:
+        best_dir = ensure_best_dir()
+    else:
+        best_dir = reset_best_dir()
+        clear_prior_logs()
 
-    display.banner('node 0: reproducing baseline')
+    label = node0_label(best_dir)
+    display.banner(f'node 0: reproducing {label}')
     hparams = {'k': args.k, 'lr': args.lr, 'epochs': args.epochs}
     metrics_path = RUNS_DIR / 'node_0_metrics.json'
-    display.run_start('baseline (feature-axis seed)', args.run_timeout)
+    display.run_start(label, args.run_timeout)
     t0 = time.time()
-    result = run_candidate(best_dirs['feature'], args.data_dir, metrics_path, hparams, args.seed, args.run_timeout,
+    result = run_candidate(best_dir, args.data_dir, metrics_path, hparams, args.seed, args.run_timeout,
                             verbose=not args.quiet)
     display.run_end(t0, result['ok'])
     if not result['ok']:
-        print(f'FATAL: baseline reproduction failed: {result["error"]}')
-        write_log(0, {'iter': 0, 'axis': None, 'status': 'failed', 'error_summary': result['error']})
+        print(f'FATAL: {label} reproduction failed: {result["error"]}')
+        write_log(0, {'iter': 0, 'status': 'failed', 'error_summary': result['error']})
         sys.exit(1)
     baseline_primary = result['metrics']['valid']['primary']
-    write_log(0, {'iter': 0, 'axis': None, 'status': 'baseline', 'metrics': result['metrics']})
-    display.phase(f'baseline valid primary = {baseline_primary:.4f}')
+    write_log(0, {'iter': 0, 'status': label, 'metrics': result['metrics']})
+    display.phase(f'{label} valid primary = {baseline_primary:.4f}')
 
-    best_primary = {axis: baseline_primary for axis in AXES_ORDER}
-    best_metrics = {axis: result['metrics'] for axis in AXES_ORDER}
-    history = []
-    node_id = 1
-    total = args.iterations
-    overall_primary_trace = [baseline_primary]
+    best_primary = baseline_primary
+    best_metrics = result['metrics']
+    if args.resume:
+        history, max_prior_node = load_prior_history()
+        node_id = max_prior_node + 1 if max_prior_node >= 1 else 1
+    else:
+        history, node_id = [], 1
     converged = False
-    diagnosis_budget_left = args.diagnosis_budget
+    plateau_streak = 0  # always starts fresh, even when resuming -- only the propose-prompt
+                         # history/reflection context carries over, not the escalation pressure
+    if history:
+        display.phase(f'loaded {len(history)} prior iteration(s) from {LOGS_DIR} '
+                       f'(plateau streak reset to 0); this run continues at node {node_id}')
 
-    def note_converged():
-        nonlocal converged
-        overall_primary_trace.append(max(best_primary.values()))
-        if not converged and check_converged(overall_primary_trace, args.converge_eps, args.converge_n):
-            converged = True
-            display.converged(args.converge_eps, args.converge_n)
-
-    def show_tree():
+    def show_history():
         print()
-        display.render_tree(baseline_primary, AXES_ORDER, history)
+        display.render_history(baseline_primary, history, label=label)
 
-    # --- Phase 1: explore, one iteration per axis ---
-    explore_axes = AXES_ORDER[:min(total, len(AXES_ORDER))]
-    for axis in explore_axes:
+    for _ in range(args.iterations):
         if converged:
             break
-        display.banner(f'node {node_id} [{axis}] (explore)')
-        status, best_primary[axis], best_metrics[axis], entry = run_axis_iteration(
-            node_id, axis, best_dirs[axis], best_primary[axis], best_metrics[axis], history, args)
+        display.banner(f'node {node_id}')
+        status, best_primary, best_metrics, entry = run_iteration(
+            node_id, best_dir, best_primary, best_metrics, history, args, plateau_streak)
         history.append(entry)
-        display.result_line(entry['status'], entry.get('hypothesis'), entry.get('primary'),
-                             entry.get('prev_best'), entry.get('error_summary'))
-        node_id += 1
-        note_converged()
-        show_tree()
 
-    both_explored = len(explore_axes) == len(AXES_ORDER)
-    remaining = total - len(explore_axes)
-    reserve_synthesis_slot = both_explored and remaining >= 1
-    exploit_budget = remaining - 1 if reserve_synthesis_slot else remaining
-
-    # --- Phase 2: exploit, remaining budget goes to the current leader axis. A leader
-    # axis that racks up --stuck_after consecutive rejects/fails gets a diagnosis node
-    # (and, if data_gap, a probe node) instead of a normal propose — spent from the
-    # separate diagnosis_budget reserve, not from exploit_budget. ---
-    exploit_remaining = max(exploit_budget, 0)
-    diagnosed_axes_this_streak = set()
-    while exploit_remaining > 0 and not converged:
-        leader = max(best_primary, key=best_primary.get)
-        streak = axis_reject_streak(history, leader)
-        if streak >= args.stuck_after and diagnosis_budget_left > 0 and leader not in diagnosed_axes_this_streak:
-            display.banner(f'node {node_id} [{leader}] (diagnosis: {streak} consecutive non-improvements)')
-            category, rationale, probe_question, entry = run_diagnosis(node_id, leader, history, args)
-            history.append(entry)
-            display.diagnosis_line(category, rationale)
-            node_id += 1
-            diagnosis_budget_left -= 1
-            diagnosed_axes_this_streak.add(leader)  # don't re-diagnose until an accept resets the streak
-            show_tree()
-            if category == 'data_gap' and probe_question and diagnosis_budget_left > 0:
-                display.banner(f'node {node_id} [{leader}] (diagnostic probe)')
-                probe_entry = run_probe(node_id, leader, probe_question, args)
-                history.append(probe_entry)
-                display.probe_line(probe_entry['status'], probe_question)
-                node_id += 1
-                diagnosis_budget_left -= 1
-                show_tree()
-            continue  # diagnosis/probe nodes don't consume exploit_remaining
-
-        display.banner(f'node {node_id} [{leader}] (exploit)')
-        status, best_primary[leader], best_metrics[leader], entry = run_axis_iteration(
-            node_id, leader, best_dirs[leader], best_primary[leader], best_metrics[leader], history, args)
-        history.append(entry)
-        display.result_line(entry['status'], entry.get('hypothesis'), entry.get('primary'),
-                             entry.get('prev_best'), entry.get('error_summary'))
-        node_id += 1
-        exploit_remaining -= 1
-        if status == 'accepted':
-            diagnosed_axes_this_streak.discard(leader)
-        note_converged()
-        show_tree()
-
-    overall_axis = max(best_primary, key=best_primary.get)
-    overall_primary = best_primary[overall_axis]
-    overall_dir = best_dirs[overall_axis]
-
-    # --- Phase 3: the reserved slot — synthesize if both axes improved, else one more exploit ---
-    if reserve_synthesis_slot and not converged:
-        both_improved = all(best_primary[axis] > baseline_primary + ACCEPT_EPS for axis in AXES_ORDER)
-        if both_improved:
-            display.banner(f'node {node_id} [synthesis]')
-            status, new_primary, entry, synth_dir = run_synthesis(
-                node_id, best_dirs['feature'], best_dirs['model'], overall_primary, history, args)
-            history.append(entry)
+        if status in ('accepted', 'rejected'):
             display.result_line(entry['status'], entry.get('hypothesis'), entry.get('primary'),
                                  entry.get('prev_best'), entry.get('error_summary'))
-            node_id += 1
-            show_tree()
-            if status == 'accepted':
-                overall_axis, overall_primary, overall_dir = 'synthesis', new_primary, synth_dir
+        elif status == 'answered':
+            display.probe_line('answered', entry.get('question'))
+        elif entry.get('question') is not None:
+            display.probe_line('failed', entry.get('question'))
         else:
-            leader = max(best_primary, key=best_primary.get)
-            display.banner(f'node {node_id} [{leader}] (exploit, no synthesis: only one axis improved)')
-            status, best_primary[leader], best_metrics[leader], entry = run_axis_iteration(
-                node_id, leader, best_dirs[leader], best_primary[leader], best_metrics[leader], history, args)
-            history.append(entry)
-            display.result_line(entry['status'], entry.get('hypothesis'), entry.get('primary'),
-                                 entry.get('prev_best'), entry.get('error_summary'))
-            node_id += 1
-            show_tree()
-            overall_axis = max(best_primary, key=best_primary.get)
-            overall_primary = best_primary[overall_axis]
-            overall_dir = best_dirs[overall_axis]
+            display.result_line('failed', entry.get('hypothesis'), None, None, entry.get('error_summary'))
+        node_id += 1
 
-    overall_best = RUNS_DIR / 'best'
-    overall_best.mkdir(parents=True, exist_ok=True)
-    for fname in pt.ALLOWED_FILES:
-        shutil.copy2(overall_dir / fname, overall_best / fname)
+        if status in ('accepted', 'rejected'):
+            gain = entry['primary'] - entry['prev_best']
+            plateau_streak = 0 if gain > args.converge_eps else plateau_streak + 1
+            if plateau_streak >= args.converge_n:
+                if args.early_stop:
+                    converged = True
+                    display.converged(args.converge_eps, args.converge_n)
+                else:
+                    display.phase(f'plateau streak hit {plateau_streak} (would converge per '
+                                   f'epsilon={args.converge_eps}, N={args.converge_n}) but '
+                                   f'--no-early_stop is set -- continuing')
+        # probe/failed nodes leave plateau_streak untouched -- no metric outcome to judge
 
-    display.banner(f'done: best valid primary = {overall_primary:.4f} (from [{overall_axis}])')
-    print('per-axis best: ' + ', '.join(f'{a}={best_primary[a]:.4f}' for a in AXES_ORDER))
+        show_history()
+
+    display.banner(f'done: best valid primary = {best_primary:.4f} (from {label} {baseline_primary:.4f})')
+    print(f'plateau streak at end: {plateau_streak}')
     if converged:
         print(f'stopped early: converged per epsilon={args.converge_eps}, N={args.converge_n}')
-    print(f'diagnosis/probe nodes used: {args.diagnosis_budget - diagnosis_budget_left}/{args.diagnosis_budget}')
-    print(f'overall best code in {overall_best}, per-node logs in {LOGS_DIR}')
+    print(f'best code in {best_dir}, per-node logs in {LOGS_DIR}')
 
 
 if __name__ == '__main__':

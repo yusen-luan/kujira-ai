@@ -6,12 +6,26 @@ formatting logic.
 Goal (per user request): make a plain `python agent/orchestrator.py` run legible in a
 terminal at all times — which phase is running, every LLM call (what it was asked to
 do and a preview of what it said back), live per-epoch training progress instead of a
-silent multi-minute subprocess, and a running hypothesis tree showing how the two axes
-have branched and why. Not a TUI/curses redraw — plain scrolling output, same category
+silent multi-minute subprocess, and a running history of the iteration chain showing
+what was tried and why. Not a TUI/curses redraw — plain scrolling output, same category
 of tool as a build log, just narrated.
 """
 import sys
 import time
+
+# Windows consoles that aren't UTF-8 configured (legacy cmd.exe/PowerShell, some CI
+# runners) default Python's stdout to the system codepage (e.g. cp1252), which can't
+# encode the arrow/bullet symbols below and crashes with UnicodeEncodeError on the
+# first one printed. Force UTF-8 with a safe fallback so this module works regardless
+# of the terminal's configured codepage -- worst case on a truly incompatible terminal
+# is a '?' in place of a symbol, never a crash. No-op (and harmless) on terminals that
+# are already UTF-8, which is the common case (WSL/Linux/macOS terminals, Windows
+# Terminal).
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding='utf-8', errors='replace')
+    except (AttributeError, ValueError):
+        pass
 
 _USE_COLOR = sys.stdout.isatty()
 _QUIET = False
@@ -128,10 +142,6 @@ def result_line(status, hypothesis, primary, prev_best, error_summary=None):
         print(f'  {_red("FAILED")}    "{hyp}"  — {error_summary}')
 
 
-def diagnosis_line(category, rationale):
-    print(f'  {_magenta("diagnosis")} → {_bold(category)}  {_trunc(rationale, 100)}')
-
-
 def probe_line(status, question):
     tag = _green('answered') if status == 'answered' else _red('FAILED')
     print(f'  {_magenta("probe")} {tag}  "{_trunc(question, 90)}"')
@@ -148,17 +158,23 @@ def _trunc(s, n):
     return s if len(s) <= n else s[:n - 1] + '…'
 
 
-# ---------------- hypothesis tree ----------------
+# ---------------- run history (v2: single linear chain, no more axis branches) ----------------
+
+def _sweep_tag(h):
+    sweep = h.get('sweep')
+    if not sweep:
+        return ''
+    n_ok = sum(1 for t in sweep['trials'] if t['ok'])
+    return f'  [swept {sweep["param"]}={sweep["best_value"]} best of {n_ok}/{len(sweep["trials"])}]'
+
 
 def _node_line(h):
     status = h.get('status')
     tag = f'[{h["iter"]}]'
     if status == 'accepted':
-        return f'{tag} {_green("accepted")}  {h["primary"]:.4f}  "{_trunc(h.get("hypothesis"), 70)}"'
+        return f'{tag} {_green("accepted")}  {h["primary"]:.4f}  "{_trunc(h.get("hypothesis"), 70)}"{_sweep_tag(h)}'
     if status == 'rejected':
-        return f'{tag} {_yellow("rejected")}  {h["primary"]:.4f}  "{_trunc(h.get("hypothesis"), 70)}"'
-    if status == 'diagnosed':
-        return f'{tag} {_magenta("diagnosis")}  category={h.get("category")}'
+        return f'{tag} {_yellow("rejected")}  {h["primary"]:.4f}  "{_trunc(h.get("hypothesis"), 70)}"{_sweep_tag(h)}'
     if status == 'answered':
         return f'{tag} {_magenta("probe")}  "{_trunc(h.get("question"), 70)}"'
     if status == 'failed' and h.get('question') is not None:
@@ -166,29 +182,15 @@ def _node_line(h):
     return f'{tag} {_red("FAILED")}  "{_trunc(h.get("hypothesis"), 70)}"'
 
 
-def render_tree(baseline_primary, axes_order, history):
-    """Groups history entries by root axis (feature/model/synthesis -- a
-    '<axis>_diagnosis'/'<axis>_probe' entry's root is `axis`) and renders them as a
-    branch each, in chronological order within a branch. Called after every node so
-    re-printing it gives a live-updating picture of how the run has branched."""
-    groups, order = {}, []
+def render_history(baseline_primary, history, label='baseline'):
+    """Flat, chronological list -- there's only one chain now (v2 dropped the v1
+    feature/model axis-tree), so no grouping/branching is needed. Called after every
+    node so re-printing it gives a live-updating picture of the run. `label` is
+    'baseline' only when node 0 actually reproduced workspace/'s pristine files --
+    with --resume (the default) after any prior accept, node 0 re-runs the carried-over
+    best/ state instead, which node0_label() in orchestrator.py detects and labels
+    'last best' so this line doesn't misleadingly claim to be the organizer's reference."""
+    lines = [_bold('run history so far:'), f'  {_dim("●")} {label:10s} primary {baseline_primary:.4f}']
     for h in history:
-        axis = h.get('axis') or 'synthesis'
-        root = axis.split('_')[0] if not axis.startswith('synthesis') else 'synthesis'
-        groups.setdefault(root, []).append(h)
-        if root not in order:
-            order.append(root)
-    root_order = [a for a in axes_order if a in groups] + [r for r in order if r not in axes_order]
-
-    lines = [_bold('hypothesis tree so far:'), f'  {_dim("●")} baseline   primary {baseline_primary:.4f}']
-    for i, root in enumerate(root_order):
-        is_last_root = i == len(root_order) - 1
-        root_branch = '  └─' if is_last_root else '  ├─'
-        lines.append(f'{root_branch} {_bold(root)}')
-        entries = groups[root]
-        child_prefix = '     ' if is_last_root else '  │  '
-        for j, h in enumerate(entries):
-            is_last = j == len(entries) - 1
-            connector = '└─' if is_last else '├─'
-            lines.append(f'{child_prefix}{connector} {_node_line(h)}')
+        lines.append(f'  {_node_line(h)}')
     print('\n'.join(lines))
