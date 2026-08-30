@@ -147,6 +147,26 @@ def probe_line(status, question):
     print(f'  {_magenta("probe")} {tag}  "{_trunc(question, 90)}"')
 
 
+def research_line(status, question, note_title=None):
+    if status == 'researched':
+        print(f'  {_magenta("web research")} {_green("found")}  "{_trunc(note_title, 60)}"  '
+              f'for "{_trunc(question, 60)}"')
+    elif status == 'research_denied':
+        print(f'  {_magenta("web research")} {_yellow("denied (budget exhausted)")}  "{_trunc(question, 90)}"')
+    else:
+        print(f'  {_magenta("web research")} {_red("no reliable source")}  "{_trunc(question, 90)}"')
+
+
+def explore_line(status, question, note_title=None):
+    if status == 'explored':
+        print(f'  {_magenta("repo explore")} {_green("found")}  "{_trunc(note_title, 60)}"  '
+              f'for "{_trunc(question, 60)}"')
+    elif status == 'explore_denied':
+        print(f'  {_magenta("repo explore")} {_yellow("denied (budget exhausted)")}  "{_trunc(question, 90)}"')
+    else:
+        print(f'  {_magenta("repo explore")} {_red("nothing relevant found")}  "{_trunc(question, 90)}"')
+
+
 def converged(eps, n):
     print(f'  {_yellow("●")} converged: no >{eps} improvement over the last {n} nodes — stopping early')
 
@@ -168,17 +188,33 @@ def _sweep_tag(h):
     return f'  [swept {sweep["param"]}={sweep["best_value"]} best of {n_ok}/{len(sweep["trials"])}]'
 
 
+def _variants_tag(h):
+    variants = h.get('variants')
+    if not variants:
+        return ''
+    n_ok = sum(1 for v in variants if v['ok'])
+    return f'  [raced {len(variants)} variants, winner v{h.get("winning_variant")}, {n_ok}/{len(variants)} ran ok]'
+
+
 def _node_line(h):
     status = h.get('status')
     tag = f'[{h["iter"]}]'
     if status == 'accepted':
-        return f'{tag} {_green("accepted")}  {h["primary"]:.4f}  "{_trunc(h.get("hypothesis"), 70)}"{_sweep_tag(h)}'
+        return (f'{tag} {_green("accepted")}  {h["primary"]:.4f}  "{_trunc(h.get("hypothesis"), 70)}"'
+                 f'{_sweep_tag(h)}{_variants_tag(h)}')
     if status == 'rejected':
-        return f'{tag} {_yellow("rejected")}  {h["primary"]:.4f}  "{_trunc(h.get("hypothesis"), 70)}"{_sweep_tag(h)}'
+        return (f'{tag} {_yellow("rejected")}  {h["primary"]:.4f}  "{_trunc(h.get("hypothesis"), 70)}"'
+                 f'{_sweep_tag(h)}{_variants_tag(h)}')
     if status == 'answered':
         return f'{tag} {_magenta("probe")}  "{_trunc(h.get("question"), 70)}"'
     if status == 'failed' and h.get('question') is not None:
         return f'{tag} {_red("probe FAILED")}  "{_trunc(h.get("question"), 70)}"'
+    if status == 'researched':
+        return (f'{tag} {_magenta("web research")}  found "{_trunc(h.get("note_title"), 40)}" for '
+                 f'"{_trunc(h.get("research_question"), 40)}"')
+    if status in ('research_failed', 'research_denied'):
+        why = 'denied' if status == 'research_denied' else 'no source'
+        return f'{tag} {_red(f"web research {why}")}  "{_trunc(h.get("research_question"), 70)}"'
     return f'{tag} {_red("FAILED")}  "{_trunc(h.get("hypothesis"), 70)}"'
 
 

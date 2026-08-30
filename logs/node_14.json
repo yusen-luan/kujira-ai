@@ -1,0 +1,101 @@
+{
+  "iter": 14,
+  "status": "rejected",
+  "hypothesis": "Per the ESMM/MMoE literature notes (both flagged `is_like`/`is_comment` as natural auxiliary signals logged on the same rows as `long_view`), add a second, auxiliary prediction head (`is_like`) that shares the FM's embedding table `V` with the main `long_view` BPR head but has its own linear weights/bias, trained jointly via a small-weight pointwise BCE loss added to the BPR loss. This regularizes the shared user/video embeddings with a second, less-noisy gradient signal instead of just adding raw capacity, which is the untried lever after 5 straight capacity-only rejections.",
+  "reflection": "FwFM's per-field-pair weights gave essentially zero change (0.6034 vs 0.6035) and again showed the now-familiar overfitting shape (peak mid-training, degrade after) \u2014 but since early stopping already restores the best epoch's weights, that peak value itself is the real ceiling, meaning the last several capacity-only tweaks (k sweep, FwFM, DeepFM MLP) all cap out at essentially the same peak regardless of extra parameters. That points away from \"more pairwise-interaction capacity\" and toward needing a different regularizing signal on the shared embeddings rather than more capacity within the same signal.",
+  "expected_effect": "GAUC should move more than nDCG@5, since the auxiliary signal directly regularizes the shared embedding table that produces the pairwise interaction score GAUC evaluates, whereas nDCG@5's top-5 cutoff is a more indirect downstream consequence of the same embeddings.",
+  "lever_category": "multi_task",
+  "changed_files": [
+    "data.py",
+    "baseline.py"
+  ],
+  "sweep": {
+    "param": "alpha_aux",
+    "trials": [
+      {
+        "value": 0.03,
+        "ok": true,
+        "primary": 0.603861190201157,
+        "error": null
+      },
+      {
+        "value": 0.1,
+        "ok": true,
+        "primary": 0.6020203191560153,
+        "error": null
+      },
+      {
+        "value": 0.3,
+        "ok": true,
+        "primary": 0.6002639239323286,
+        "error": null
+      },
+      {
+        "value": 1,
+        "ok": true,
+        "primary": 0.5968350284459285,
+        "error": null
+      }
+    ],
+    "best_value": 0.03
+  },
+  "metrics": {
+    "valid": {
+      "GAUC": 0.6708569597462394,
+      "nDCG@5": 0.5368654206560748,
+      "primary": 0.603861190201157,
+      "users": 22377,
+      "rows": 124909
+    },
+    "test": {
+      "GAUC": 0.6641102651971368,
+      "nDCG@5": 0.5308615894140842,
+      "primary": 0.5974859273056106,
+      "users": 23875,
+      "rows": 170588
+    }
+  },
+  "prev_metrics": {
+    "valid": {
+      "GAUC": 0.6701663237546387,
+      "nDCG@5": 0.5369113520545421,
+      "primary": 0.6035388379045904,
+      "users": 22377,
+      "rows": 124909
+    },
+    "test": {
+      "GAUC": 0.6643671563121321,
+      "nDCG@5": 0.5306763487800008,
+      "primary": 0.5975217525460664,
+      "users": 23875,
+      "rows": 170588
+    }
+  },
+  "training_curve": {
+    "n_epochs_logged": 10,
+    "first_epoch_primary": 0.5938,
+    "best_epoch": 6,
+    "best_epoch_primary": 0.6039,
+    "last_epoch": 10,
+    "last_epoch_primary": 0.6018,
+    "early_stopped": true,
+    "degraded_after_best": true,
+    "still_improving_at_cutoff": false
+  },
+  "prev_best_primary": 0.6035388379045904,
+  "new_primary": 0.603861190201157,
+  "llm_calls": [
+    {
+      "cost_usd": 0.3005182,
+      "ok": true,
+      "error": null
+    }
+  ],
+  "run_attempts": [
+    {
+      "attempt": 0,
+      "ok": true,
+      "error": null
+    }
+  ]
+}

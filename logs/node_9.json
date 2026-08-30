@@ -1,0 +1,124 @@
+{
+  "iter": 9,
+  "status": "rejected",
+  "hypothesis": "Replace the order-2-only FM scoring function with a small DeepFM-style architecture (FM term + a 2-layer MLP over the concatenated field embeddings), trained with the same BPR pairwise loss and same negative-sampling scheme that already works best. Since plain order-2 FM has plateaued for 4 straight iterations regardless of features/regularization/negative-sampling tweaks (per the exact \"if a deeper model can't beat plain FM the extra capacity likely isn't buying anything on this feature set yet, the fix is more/better features not a bigger model\" caveat in the FM literature note \u2014 but that caveat cuts both ways: we've now exhausted several feature/training-procedure levers at fixed order-2 capacity without moving the needle, so it's time to actually test whether extra capacity helps), adding an MLP branch to capture higher-order (3-way+) feature interactions the FM term structurally cannot represent is the untried lever.",
+  "reflection": "",
+  "expected_effect": "nDCG@5 should move more than GAUC, since the MLP branch adds a more expressive nonlinear scoring function that should sharpen top-of-list discrimination beyond what pure pairwise second-order interactions can capture, while overall GAUC (average pairwise ordering) is already fairly well-served by the existing FM+BPR combination.",
+  "changed_files": [
+    "baseline.py"
+  ],
+  "sweep": {
+    "param": "dropout",
+    "trials": [
+      {
+        "value": 0,
+        "ok": true,
+        "primary": 0.601467369594994,
+        "error": null
+      },
+      {
+        "value": 0.1,
+        "ok": true,
+        "primary": 0.601467369594994,
+        "error": null
+      },
+      {
+        "value": 0.2,
+        "ok": true,
+        "primary": 0.601467369594994,
+        "error": null
+      },
+      {
+        "value": 0.3,
+        "ok": true,
+        "primary": 0.601467369594994,
+        "error": null
+      }
+    ],
+    "best_value": 0
+  },
+  "metrics": {
+    "valid": {
+      "GAUC": 0.6671393141142216,
+      "nDCG@5": 0.5357954250757665,
+      "primary": 0.601467369594994,
+      "users": 22377,
+      "rows": 124909
+    },
+    "test": {
+      "GAUC": 0.663231564954689,
+      "nDCG@5": 0.5299801420278666,
+      "primary": 0.5966058534912778,
+      "users": 23875,
+      "rows": 170588
+    }
+  },
+  "prev_metrics": {
+    "valid": {
+      "GAUC": 0.6701663237546387,
+      "nDCG@5": 0.5369113520545421,
+      "primary": 0.6035388379045904,
+      "users": 22377,
+      "rows": 124909
+    },
+    "test": {
+      "GAUC": 0.6643671563121321,
+      "nDCG@5": 0.5306763487800008,
+      "primary": 0.5975217525460664,
+      "users": 23875,
+      "rows": 170588
+    }
+  },
+  "training_curve": {
+    "n_epochs_logged": 5,
+    "first_epoch_primary": 0.6004,
+    "best_epoch": 2,
+    "best_epoch_primary": 0.6015,
+    "last_epoch": 5,
+    "last_epoch_primary": 0.5891,
+    "early_stopped": true,
+    "degraded_after_best": true,
+    "still_improving_at_cutoff": false
+  },
+  "prev_best_primary": 0.6035388379045904,
+  "new_primary": 0.601467369594994,
+  "llm_calls": [
+    {
+      "cost_usd": null,
+      "ok": false,
+      "error": "llm call timed out after 180s"
+    },
+    {
+      "cost_usd": 0.1728608,
+      "ok": true,
+      "error": null
+    },
+    {
+      "cost_usd": 0.1985154,
+      "ok": true,
+      "error": null
+    },
+    {
+      "cost_usd": 0.1580844,
+      "ok": true,
+      "error": null
+    }
+  ],
+  "run_attempts": [
+    {
+      "attempt": 0,
+      "ok": false,
+      "error": "  loading data from /home/yusen-luan/tiktok_techjam_2026/workspace/data ...\n  loaded (10s): train=1141112, valid=124909, test=170588\n  starting training...\nTraceback (most recent call last):\n  File \"/home/yusen-luan/tiktok_techjam_2026/agent/run_and_report.py\", line 73, in <module>\n    main()\n  File \"/home/yusen-luan/tiktok_techjam_2026/agent/run_and_report.py\", line 65, in main\n    result = baseline.run_model(splits, hparams=hparams, seed=a.seed, verbose=a.verbose)\n             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/yusen-luan/tiktok_techjam_2026/agent/runs/node_9/baseline.py\", line 328, in run_model\n    return run_deepfm_bpr(splits, seed=seed, verbose=verbose, **kwargs)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/yusen-luan/tiktok_techjam_2026/agent/runs/node_9/baseline.py\", line 230, in run_deepfm_bpr\n    import torch\nModuleNotFoundError: No module named 'torch'\n"
+    },
+    {
+      "attempt": 1,
+      "ok": false,
+      "error": "  loading data from /home/yusen-luan/tiktok_techjam_2026/workspace/data ...\n  loaded (10s): train=1141112, valid=124909, test=170588\n  starting training...\nTraceback (most recent call last):\n  File \"/home/yusen-luan/tiktok_techjam_2026/agent/run_and_report.py\", line 73, in <module>\n    main()\n  File \"/home/yusen-luan/tiktok_techjam_2026/agent/run_and_report.py\", line 65, in main\n    result = baseline.run_model(splits, hparams=hparams, seed=a.seed, verbose=a.verbose)\n             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/yusen-luan/tiktok_techjam_2026/agent/runs/node_9/baseline.py\", line 418, in run_model\n    return run_deepfm_bpr(splits, seed=seed, verbose=verbose, **kwargs)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nTypeError: run_deepfm_bpr() got an unexpected keyword argument 'dropout'\n"
+    },
+    {
+      "attempt": 2,
+      "ok": true,
+      "error": null
+    }
+  ]
+}

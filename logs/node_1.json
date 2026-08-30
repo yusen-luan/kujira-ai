@@ -1,0 +1,70 @@
+{
+  "iter": 1,
+  "status": "rejected",
+  "hypothesis": "Add rich user profile/social-graph fields (user_active_degree, follow/fans/friend_user_num_range, register_days_range, cleaned is_live_streamer, is_video_author) from user_features_pure.csv as new categorical FM fields \u2014 per EDA's \"unused data available\" note, these are currently completely unjoined, and richer user-side signal should help personalization especially for the ~30-36% of users the current user_id-only embedding sees rarely, without touching the model or training loop.",
+  "reflection": "",
+  "expected_effect": "GAUC should move more than nDCG@5, since these are per-user static features that primarily improve within-user ranking discrimination (the metric most sensitive to better personalization for sparse/cold users), while nDCG@5's top-of-list ranking is more item-popularity-driven and less affected by user-side features.",
+  "changed_files": [
+    "data.py"
+  ],
+  "sweep": null,
+  "metrics": {
+    "valid": {
+      "GAUC": 0.6657776069980964,
+      "nDCG@5": 0.5355147935905044,
+      "primary": 0.6006462002943004,
+      "users": 22377,
+      "rows": 124909
+    },
+    "test": {
+      "GAUC": 0.661596414556344,
+      "nDCG@5": 0.5286116833415957,
+      "primary": 0.5951040489489698,
+      "users": 23875,
+      "rows": 170588
+    }
+  },
+  "prev_metrics": {
+    "valid": {
+      "GAUC": 0.6671326321610643,
+      "nDCG@5": 0.5358048805448711,
+      "primary": 0.6014687563529677,
+      "users": 22377,
+      "rows": 124909
+    },
+    "test": {
+      "GAUC": 0.6621228758829982,
+      "nDCG@5": 0.5285584577777603,
+      "primary": 0.5953406668303793,
+      "users": 23875,
+      "rows": 170588
+    }
+  },
+  "training_curve": {
+    "n_epochs_logged": 8,
+    "first_epoch_primary": 0.5943,
+    "best_epoch": 4,
+    "best_epoch_primary": 0.6006,
+    "last_epoch": 8,
+    "last_epoch_primary": 0.5998,
+    "early_stopped": true,
+    "degraded_after_best": true,
+    "still_improving_at_cutoff": false
+  },
+  "prev_best_primary": 0.6014687563529677,
+  "new_primary": 0.6006462002943004,
+  "llm_calls": [
+    {
+      "cost_usd": 0.146809,
+      "ok": true,
+      "error": null
+    }
+  ],
+  "run_attempts": [
+    {
+      "attempt": 0,
+      "ok": true,
+      "error": null
+    }
+  ]
+}

@@ -1,0 +1,9 @@
+# The entire pipeline (data loading, FM model, BPR training, evaluation, agent
+# orchestration/EDA/RAG) is numpy + Python stdlib only.
+numpy>=1.24
+
+# Optional: only needed if you want to experiment with workspace/models/*.py,
+# an unwired reference model zoo (DeepFM/DCN/AutoInt/xDeepFM) carried over from
+# prior work -- not required to reproduce anything in this README.
+# torch
+# torchfm

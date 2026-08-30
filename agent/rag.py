@@ -27,6 +27,8 @@ AGENT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = AGENT_DIR.parent
 LITERATURE_DIR = AGENT_DIR / 'literature'
 RUNS_DIR = AGENT_DIR / 'runs'
+WEB_LITERATURE_DIR = RUNS_DIR / 'web_literature'
+REPO_NOTES_DIR = RUNS_DIR / 'repo_notes'
 REPORT_PATH = RUNS_DIR / 'eda_report.json'
 CONTEXT_PATH = RUNS_DIR / 'literature_context.md'
 
@@ -40,10 +42,13 @@ def _tokenize(text):
     return _TOKEN_RE.findall(text.lower())
 
 
-def _parse_doc(path):
-    """Splits a `---\\nkey: val\\n---\\nbody` note into (meta dict, body text)."""
+def _parse_doc(path, default_source='curated'):
+    """Splits a `---\\nkey: val\\n---\\nbody` note into (meta dict, body text).
+    `default_source` tags which directory a note came from (curated vs. web-research-
+    found this run); a note's own `source:` header line, if present, overrides it --
+    web_research.py's saved notes always set one explicitly."""
     text = path.read_text(encoding='utf-8')
-    meta = {'title': path.stem, 'citation': '', 'tags': ''}
+    meta = {'title': path.stem, 'citation': '', 'tags': '', 'source': default_source}
     body = text
     if text.startswith('---'):
         end = text.find('\n---', 3)
@@ -57,7 +62,20 @@ def _parse_doc(path):
 
 
 def load_corpus():
-    return [_parse_doc(p) for p in sorted(LITERATURE_DIR.glob('*.md'))]
+    """Curated corpus (agent/literature/, checked into the repo, vetted once by a human --
+    a note in here can still self-declare `source: project` in its own header, e.g. this
+    project's own ablation findings, distinct from an externally published method) plus
+    whatever agent/web_research.py (agent/runs/web_literature/) and agent/repo_explore.py
+    (agent/runs/repo_notes/) have found and saved this run -- all gitignored except
+    agent/literature/ itself. Kept in separate directories so provenance is unambiguous,
+    merged here for retrieval, and distinguished in build_grounding_context() below so the
+    propose prompt always knows which is which."""
+    docs = [_parse_doc(p, default_source='curated') for p in sorted(LITERATURE_DIR.glob('*.md'))]
+    if WEB_LITERATURE_DIR.exists():
+        docs += [_parse_doc(p, default_source='web') for p in sorted(WEB_LITERATURE_DIR.glob('*.md'))]
+    if REPO_NOTES_DIR.exists():
+        docs += [_parse_doc(p, default_source='repo_explore') for p in sorted(REPO_NOTES_DIR.glob('*.md'))]
+    return docs
 
 
 def _bm25_scores(docs, query, k1=1.5, b=0.75):
@@ -96,7 +114,8 @@ def build_query(eda_report):
     something to match on) plus terms triggered by specific EDA findings (so the
     situational notes -- multi-task, popularity debiasing, dataset background --
     surface only when the data actually calls for them)."""
-    terms = ['CTR prediction', 'ranking', 'feature interaction', 'recommendation', 'embedding', 'KuaiRand']
+    terms = ['CTR prediction', 'ranking', 'feature interaction', 'recommendation', 'embedding', 'KuaiRand',
+              'ablation', 'field count', 'vocab size', 'capacity']
 
     rates = eda_report.get('label_base_rates_by_split', {}).get('train', {})
     sparse_signals = [c for c, r in rates.items()
@@ -119,16 +138,36 @@ def build_query(eda_report):
     return ' '.join(terms)
 
 
+_SOURCE_TAGS = {
+    'web': '[found via live web search this run]',
+    'project': "[this project's own internal analysis]",
+    'repo_explore': "[found by reading this project's own repo this run]",
+}
+
+
 def build_grounding_context(eda_report, top_k=5):
     query = build_query(eda_report)
     ranked = retrieve(query, top_k=top_k)
-    parts = [f"(retrieved via local BM25 search over agent/literature/, query terms: {query})"]
+    parts = [f"(retrieved via local BM25 search over agent/literature/ + agent/runs/web_literature/ + "
+             f"agent/runs/repo_notes/, query terms: {query})"]
     for doc, score in ranked:
         title = doc['meta'].get('title', doc['path'].stem)
         citation = doc['meta'].get('citation', '')
-        header = f"### {title}" + (f"  ({citation})" if citation else '')
+        tag = _SOURCE_TAGS.get(doc['meta'].get('source'), '[curated]')
+        header = f"### {tag} {title}" + (f"  ({citation})" if citation else '')
         parts.append(f"{header}\n{doc['body']}")
     return '\n\n'.join(parts)
+
+
+def best_score(query, docs=None):
+    """Top BM25 score for `query` against the current corpus -- lets a caller (the
+    orchestrator's plateau-escalation path) check whether the existing corpus (curated +
+    anything already found via web research this run) already covers a topic well enough
+    that spending a web-research budget slot on it wouldn't be worth it. Returns 0.0 for
+    an empty corpus or a query with no matching terms at all."""
+    docs = docs if docs is not None else load_corpus()
+    scores = _bm25_scores(docs, query)
+    return max(scores) if scores else 0.0
 
 
 def run(out_dir=RUNS_DIR, top_k=5):

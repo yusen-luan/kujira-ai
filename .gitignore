@@ -7,12 +7,31 @@ docs/webinar_notes.txt
 # --- Data (large, redistributed by organizers — not for version control) ---
 workspace/data/
 
-# --- Generated outputs (keep the directory, ignore its contents) ---
+# --- Generated outputs: keep the deliverable artifacts (per-iteration logs, the
+# --- current best checkpoint, EDA/literature context, final submission CSVs),
+# --- ignore only the bulky/regenerable per-node working copies and backups.
 logs/*
 !logs/.gitkeep
+!logs/node_*.json
+logs/backup/
+logs_backup_*/
+
 submission/*
 !submission/.gitkeep
-agent/runs/
+!submission/*.csv
+
+agent/runs/*
+!agent/runs/best/
+!agent/runs/eda_report.json
+!agent/runs/eda_summary.md
+!agent/runs/literature_context.md
+!agent/runs/web_literature/
+!agent/runs/repo_notes/
+!agent/runs/node_*/
+!agent/runs/node_0_metrics.json
+# still excluded by the agent/runs/* rule above (not negated): archive/, backup/
+# -- one-off snapshots from --no-resume, not part of the run's own narrative.
+agent/runs_backup_*/
 
 # --- Python ---
 __pycache__/

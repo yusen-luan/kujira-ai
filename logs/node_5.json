@@ -1,0 +1,99 @@
+{
+  "iter": 5,
+  "status": "rejected",
+  "hypothesis": "Expose the FM's L2 weight-decay strength as a tunable hparam (currently hardcoded at a near-zero 1e-6) and sweep it upward, since the BPR training curve's post-peak degradation is a textbook under-regularization signature \u2014 a stronger L2 penalty should let training run longer before the pairwise objective starts overfitting per-user idiosyncrasies, recovering some of the primary lost between epoch 6 and the early-stop point.",
+  "reflection": "BPR (iter 4) worked as predicted \u2014 GAUC gained 3x more than nDCG@5, confirming the pairwise objective targets GAUC's own definition \u2014 but the training curve shows a clear overfitting signature (peak at epoch 6, degraded by epoch 10), meaning the current L2 (hardcoded at 1e-6, effectively negligible) isn't restraining the pairwise objective from over-fitting user-specific noise as training continues.",
+  "expected_effect": "GAUC should move more than nDCG@5, since BPR's pairwise loss (and its overfitting) is concentrated on per-user ranking noise exactly like GAUC measures, whereas nDCG@5 already showed a smaller BPR-driven swing last iteration.",
+  "changed_files": [
+    "baseline.py"
+  ],
+  "sweep": {
+    "param": "l2",
+    "trials": [
+      {
+        "value": 1e-06,
+        "ok": true,
+        "primary": 0.6035388379045904,
+        "error": null
+      },
+      {
+        "value": 1e-05,
+        "ok": true,
+        "primary": 0.6033037833286994,
+        "error": null
+      },
+      {
+        "value": 0.0001,
+        "ok": true,
+        "primary": 0.6030771584322445,
+        "error": null
+      },
+      {
+        "value": 0.001,
+        "ok": true,
+        "primary": 0.5984836067928878,
+        "error": null
+      }
+    ],
+    "best_value": 1e-06
+  },
+  "metrics": {
+    "valid": {
+      "GAUC": 0.6701663237546387,
+      "nDCG@5": 0.5369113520545421,
+      "primary": 0.6035388379045904,
+      "users": 22377,
+      "rows": 124909
+    },
+    "test": {
+      "GAUC": 0.6643671563121321,
+      "nDCG@5": 0.5306763487800008,
+      "primary": 0.5975217525460664,
+      "users": 23875,
+      "rows": 170588
+    }
+  },
+  "prev_metrics": {
+    "valid": {
+      "GAUC": 0.6701663237546387,
+      "nDCG@5": 0.5369113520545421,
+      "primary": 0.6035388379045904,
+      "users": 22377,
+      "rows": 124909
+    },
+    "test": {
+      "GAUC": 0.6643671563121321,
+      "nDCG@5": 0.5306763487800008,
+      "primary": 0.5975217525460664,
+      "users": 23875,
+      "rows": 170588
+    }
+  },
+  "training_curve": {
+    "n_epochs_logged": 10,
+    "first_epoch_primary": 0.594,
+    "best_epoch": 6,
+    "best_epoch_primary": 0.6035,
+    "last_epoch": 10,
+    "last_epoch_primary": 0.6022,
+    "early_stopped": true,
+    "degraded_after_best": true,
+    "still_improving_at_cutoff": false
+  },
+  "prev_best_primary": 0.6035388379045904,
+  "new_primary": 0.6035388379045904,
+  "llm_calls": [
+    {
+      "cost_usd": 0.1326974,
+      "ok": true,
+      "error": null
+    }
+  ],
+  "run_attempts": [
+    {
+      "attempt": 0,
+      "ok": true,
+      "error": null
+    }
+  ]
+}

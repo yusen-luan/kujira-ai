@@ -1,0 +1,26 @@
+{
+  "iter": 3,
+  "status": "researched",
+  "research_question": "For implicit-feedback CTR/ranking models evaluated on GAUC (per-user AUC) and nDCG@k, is there a well-established pairwise or listwise ranking loss (e.g., BPR-style pairwise logistic loss sampled within each user's impressions, or a listwise softmax loss) that reliably outperforms plain pointwise binary cross-entropy for optimizing these specific rank-based metrics in a factorization-machine-style model, and is it practical to implement with only numpy/torch on CPU within a small per-epoch time budget (i.e., does it require expensive per-user negative sampling or can it be done efficiently in-batch)?",
+  "reflection": "Two feature-engineering attempts in a row (user profile fields, then a historical-rate field) both overfit and actively hurt GAUC on a plain-FM pointwise-BCE trainer \u2014 the mechanism (more sparse categorical fields \u2192 more noisy pairwise interactions, early-stopping doesn't fully rescue it) looks exhausted, and the plateau warning is right that another feature variant would likely repeat the same failure. Rather than guess a third feature, I want to check whether the training objective itself is mismatched with the eval metric before touching features again.",
+  "note": {
+    "title": "BPR Pairwise Loss for Optimizing GAUC/nDCG in Implicit-Feedback Ranking",
+    "citation": "Rendle, Freudenthaler, Gantner, Schmidt-Thieme, UAI 2009 (arXiv:1205.2618)",
+    "tags": "BPR, pairwise ranking loss, GAUC, per-user AUC, nDCG, implicit feedback, factorization machine, in-batch negative sampling, sampled softmax, pointwise BCE",
+    "source_url": "https://arxiv.org/abs/1205.2618",
+    "body": "Yes \u2014 Bayesian Personalized Ranking (BPR) is the well-established, widely-used pairwise loss for this exact setting: it directly maximizes the probability that an observed (positive) item is ranked above an unobserved (negative) item *for the same user*, which is mathematically the per-user pairwise comparison that GAUC measures, so BPR-style training tends to track GAUC/nDCG more faithfully than pointwise BCE, which only calibrates per-example probabilities and ignores within-user ordering. It is cheap: for each training step you sample one positive and one negative item from the *same user's* impressions (not global negative sampling), compute `score(pos) - score(neg)`, and apply `-log(sigmoid(diff))`; this is O(1) extra work per pair beyond a normal FM forward/backward pass and needs no expensive candidate retrieval, so it fits comfortably in a small numpy/torch CPU per-epoch budget. In-batch variants are also practical \u2014 you can build positive/negative pairs within a shuffled mini-batch grouped by user_id (vectorized via index masks in torch), avoiding any per-user Python loop. Caveats found in follow-up literature (not from the source_url, so not independently verified here beyond publisher attribution): the ACM TOIS paper \"On the Effectiveness of Sampled Softmax Loss for Item Recommendation\" (Wu et al., ACM TOIS 2023) reports sampled/in-batch softmax listwise losses can outperform BPR on some benchmarks but are more sensitive to the number of negatives; and the ACM RecSys 2023 paper on gSASRec (dl.acm.org) warns that naively using in-batch negatives with plain BCE causes overconfidence and metric degradation, which is why BPR's explicit pairwise formulation (or sampled-softmax) is generally preferred over BCE-with-in-batch-negatives. For a KuaiRand-Pure-style sparse, popularity-skewed short-video setting, sampling negatives *within the same user's impression list* (rather than globally) is especially important so popular items don't dominate the negative pool and bias the pairwise gradient."
+  },
+  "saved_path": "/home/yusen-luan/tiktok_techjam_2026/agent/runs/web_literature/3_bpr_pairwise_loss_for_optimizing_gauc_ndcg_in_implicit_feedb.md",
+  "llm_calls": [
+    {
+      "cost_usd": 0.06993640000000001,
+      "ok": true,
+      "error": null
+    },
+    {
+      "cost_usd": 0.12204340000000002,
+      "ok": true,
+      "error": null
+    }
+  ]
+}

@@ -1,0 +1,100 @@
+{
+  "iter": 16,
+  "status": "rejected",
+  "hypothesis": "Per the curated popularity-bias survey note (option (a): reweight training examples inversely to item popularity), reweight each BPR training pair by `pop_video^(-pop_alpha)` (mean-normalized so `pop_alpha=0` exactly reproduces the current best) so that positives on ultra-popular videos contribute less gradient than positives on long-tail videos \u2014 this is a genuinely untried lever (all prior attempts were capacity/architecture/temporal-reweighting, never popularity-aware reweighting) and directly targets the EDA's documented Gini=0.79 popularity skew, which the `pop`-only baseline already shows explains a large share of achievable score.",
+  "reflection": "The recency-reweighting experiment gave numerically identical results to baseline (decay=0 reproduced exactly, and nonzero decays all underperformed), so temporal drift within the training window just isn't the lever \u2014 the FM+BPR architecture at k=16 has now plateaued across five straight rejections spanning capacity (k, DeepFM, FwFM), regularization (weight decay), and reweighting (recency, DNS) changes. Given the plateau warning I considered a research question, but I already have a concrete, literature-grounded, genuinely untried lever in hand (popularity_debiasing via inverse-popularity example reweighting) that doesn't need IPS/randomized-exposure data (which we've confirmed is unavailable) \u2014 so I'll spend this turn testing that mechanism directly rather than researching further.",
+  "expected_effect": "GAUC should move more than nDCG@5, since debiasing popularity specifically improves within-user discrimination between items of differing true relevance regardless of raw popularity \u2014 which is exactly what GAUC (an average of per-user pairwise AUCs) measures \u2014 whereas nDCG@5's top-5 cutoff is more directly dominated by whichever items are truly most relevant to that user, a less popularity-confounded quantity to begin with.",
+  "lever_category": "popularity_debiasing",
+  "changed_files": [
+    "baseline.py"
+  ],
+  "sweep": {
+    "param": "pop_alpha",
+    "trials": [
+      {
+        "value": 0,
+        "ok": true,
+        "primary": 0.6035388379045904,
+        "error": null
+      },
+      {
+        "value": 0.1,
+        "ok": true,
+        "primary": 0.6027678799515183,
+        "error": null
+      },
+      {
+        "value": 0.25,
+        "ok": true,
+        "primary": 0.5958946954105835,
+        "error": null
+      },
+      {
+        "value": 0.5,
+        "ok": true,
+        "primary": 0.5781540877539397,
+        "error": null
+      }
+    ],
+    "best_value": 0
+  },
+  "metrics": {
+    "valid": {
+      "GAUC": 0.6701663237546387,
+      "nDCG@5": 0.5369113520545421,
+      "primary": 0.6035388379045904,
+      "users": 22377,
+      "rows": 124909
+    },
+    "test": {
+      "GAUC": 0.6643671563121321,
+      "nDCG@5": 0.5306763487800008,
+      "primary": 0.5975217525460664,
+      "users": 23875,
+      "rows": 170588
+    }
+  },
+  "prev_metrics": {
+    "valid": {
+      "GAUC": 0.6701663237546387,
+      "nDCG@5": 0.5369113520545421,
+      "primary": 0.6035388379045904,
+      "users": 22377,
+      "rows": 124909
+    },
+    "test": {
+      "GAUC": 0.6643671563121321,
+      "nDCG@5": 0.5306763487800008,
+      "primary": 0.5975217525460664,
+      "users": 23875,
+      "rows": 170588
+    }
+  },
+  "training_curve": {
+    "n_epochs_logged": 10,
+    "first_epoch_primary": 0.594,
+    "best_epoch": 6,
+    "best_epoch_primary": 0.6035,
+    "last_epoch": 10,
+    "last_epoch_primary": 0.6022,
+    "early_stopped": true,
+    "degraded_after_best": true,
+    "still_improving_at_cutoff": false
+  },
+  "prev_best_primary": 0.6035388379045904,
+  "new_primary": 0.6035388379045904,
+  "llm_calls": [
+    {
+      "cost_usd": 0.17497620000000003,
+      "ok": true,
+      "error": null
+    }
+  ],
+  "run_attempts": [
+    {
+      "attempt": 0,
+      "ok": true,
+      "error": null
+    }
+  ]
+}

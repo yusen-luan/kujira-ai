@@ -1,0 +1,70 @@
+{
+  "iter": 6,
+  "status": "rejected",
+  "hypothesis": "Add the video's `tag` (content category id) from `video_features_basic_pure.csv` as a new FM categorical field. Per EDA's \"unused data available\" note, this is genuine content-level metadata not yet joined; unlike the earlier rejected `user_id`-keyed additions (profile fields, historical rate \u2014 both user-only and thus identical for the positive/negative pair within a single user in BPR training, contributing nothing to the pairwise score difference), `tag` varies *between* the positive and negative video in every BPR pair, so it can directly inform which of the two the model should rank higher \u2014 a mechanism the earlier feature attempts (tested only under the old pointwise-BCE objective anyway) never had.",
+  "reflection": "",
+  "expected_effect": "GAUC should move more than nDCG@5, since a broad content-similarity signal helps distinguish relevance across a user's whole candidate set (what GAUC aggregates over all pairs), whereas nDCG@5 only scores the top-5 slice.",
+  "changed_files": [
+    "data.py"
+  ],
+  "sweep": null,
+  "metrics": {
+    "valid": {
+      "GAUC": 0.6705478463121137,
+      "nDCG@5": 0.5367236201803045,
+      "primary": 0.6036357332462091,
+      "users": 22377,
+      "rows": 124909
+    },
+    "test": {
+      "GAUC": 0.664622122752841,
+      "nDCG@5": 0.5308057715588775,
+      "primary": 0.5977139471558592,
+      "users": 23875,
+      "rows": 170588
+    }
+  },
+  "prev_metrics": {
+    "valid": {
+      "GAUC": 0.6701663237546387,
+      "nDCG@5": 0.5369113520545421,
+      "primary": 0.6035388379045904,
+      "users": 22377,
+      "rows": 124909
+    },
+    "test": {
+      "GAUC": 0.6643671563121321,
+      "nDCG@5": 0.5306763487800008,
+      "primary": 0.5975217525460664,
+      "users": 23875,
+      "rows": 170588
+    }
+  },
+  "training_curve": {
+    "n_epochs_logged": 10,
+    "first_epoch_primary": 0.5918,
+    "best_epoch": 6,
+    "best_epoch_primary": 0.6036,
+    "last_epoch": 10,
+    "last_epoch_primary": 0.6029,
+    "early_stopped": true,
+    "degraded_after_best": true,
+    "still_improving_at_cutoff": false
+  },
+  "prev_best_primary": 0.6035388379045904,
+  "new_primary": 0.6036357332462091,
+  "llm_calls": [
+    {
+      "cost_usd": 0.1433774,
+      "ok": true,
+      "error": null
+    }
+  ],
+  "run_attempts": [
+    {
+      "attempt": 0,
+      "ok": true,
+      "error": null
+    }
+  ]
+}

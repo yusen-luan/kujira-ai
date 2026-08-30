@@ -1,0 +1,245 @@
+{
+  "label_used_by_pipeline": "long_view",
+  "row_counts": {
+    "train": 1141112,
+    "valid": 124909,
+    "test": 170588
+  },
+  "label_base_rates_by_split": {
+    "train": {
+      "is_click": 0.46344705865857166,
+      "is_like": 0.018676519044581074,
+      "is_follow": 0.001006912555472206,
+      "is_comment": 0.0025676708333625445,
+      "is_forward": 0.0009955201592832255,
+      "is_hate": 0.0004206423208238981,
+      "long_view": 0.33661989357749283,
+      "is_profile_enter": 0.02539102209073255,
+      "is_rand": 0.0,
+      "n_rows": 1141112
+    },
+    "valid": {
+      "is_click": 0.44382710613326504,
+      "is_like": 0.017973084405447166,
+      "is_follow": 0.0013049500036026228,
+      "is_comment": 0.002329696018701615,
+      "is_forward": 0.000776565339567205,
+      "is_hate": 0.0006244546029509483,
+      "long_view": 0.313284070803545,
+      "is_profile_enter": 0.019454162630394928,
+      "is_rand": 0.0,
+      "n_rows": 124909
+    },
+    "test": {
+      "is_click": 0.4458637184327151,
+      "is_like": 0.017521748305859734,
+      "is_follow": 0.0013541397988135156,
+      "is_comment": 0.0025558655942973713,
+      "is_forward": 0.0008734494806199733,
+      "is_hate": 0.0008910357117733955,
+      "long_view": 0.31345112200154757,
+      "is_profile_enter": 0.01812554224212723,
+      "is_rand": 0.0,
+      "n_rows": 170588
+    }
+  },
+  "long_view_per_user_distribution_eval_splits": {
+    "valid": {
+      "n_users_with_impressions": 22377,
+      "pct_users_zero_positive": 0.3032131206149171,
+      "pct_users_all_positive": 0.11900612235777808,
+      "pct_users_gauc_eligible": 0.5777807570273048,
+      "median_impressions_per_user": 4.0,
+      "median_positive_per_user": 1.0
+    },
+    "test": {
+      "n_users_with_impressions": 23875,
+      "pct_users_zero_positive": 0.27107853403141363,
+      "pct_users_all_positive": 0.0922303664921466,
+      "pct_users_gauc_eligible": 0.6366910994764398,
+      "median_impressions_per_user": 5.0,
+      "median_positive_per_user": 1.0
+    }
+  },
+  "long_view_video_popularity_skew_train": {
+    "n_distinct_videos_with_impressions": 7538,
+    "total_positive_impressions": 384121.0,
+    "top1pct_videos_share_of_positives": 0.23737051606134527,
+    "gini_of_positive_counts_across_videos": 0.7935117282641816
+  },
+  "cardinality": {
+    "train_distinct_user_id": 26210,
+    "train_distinct_video_id": 7538,
+    "train_distinct_tab": 15,
+    "user_features_file_rows": 27285,
+    "video_features_file_rows": 7583,
+    "distinct_author_id_in_video_features_file": 6510
+  },
+  "cold_start_overlap_vs_train": {
+    "valid": {
+      "unseen_user_frac": 0.01593159820349214,
+      "unseen_video_frac": 0.0001360990801303349
+    },
+    "test": {
+      "unseen_user_frac": 0.03617487748258963,
+      "unseen_video_frac": 8.206907871597065e-05
+    }
+  },
+  "duration_ms_quantiles_train": {
+    "p0": 0.0,
+    "p10": 11633.0,
+    "p25": 25933.0,
+    "p50": 70233.0,
+    "p75": 136900.0,
+    "p90": 235766.0,
+    "p100": 1177720.0
+  },
+  "play_time_over_duration_ratio_by_long_view": {
+    "mean_ratio_long_view_0": 94.32903928859947,
+    "mean_ratio_long_view_1": 156.51119508488992,
+    "median_ratio_long_view_0": 0.032320308731307285,
+    "median_ratio_long_view_1": 0.9781465167001668
+  },
+  "distribution_shift_by_split": {
+    "train": {
+      "tab_share": {
+        "0": 0.13146211765365715,
+        "1": 0.7316337046670266,
+        "2": 0.03443220297394121,
+        "3": 0.0031320326138012744,
+        "4": 0.06618456382896683,
+        "5": 0.002981302448839378,
+        "6": 0.026001829794095585,
+        "7": 0.0002918206100715793,
+        "8": 0.002235538667545342,
+        "9": 0.0002208372184325465,
+        "10": 7.010705347064969e-05,
+        "11": 0.00036543301621576145,
+        "12": 0.0007308660324315229,
+        "13": 0.00024800370165242323,
+        "14": 9.639719852214331e-06
+      },
+      "mean_duration_ms": 97879.89523640099,
+      "long_view_rate": 0.33661989357749283
+    },
+    "valid": {
+      "tab_share": {
+        "0": 0.10988799846288098,
+        "1": 0.7419161149316702,
+        "2": 0.030694345483511996,
+        "3": 0.0014170315990040749,
+        "4": 0.06306190906980282,
+        "5": 0.002329696018701615,
+        "6": 0.04139013201610773,
+        "7": 0.0006724895724087135,
+        "8": 0.004379188048899599,
+        "9": 0.0007365361983524006,
+        "10": 0.00024017484728882627,
+        "11": 0.000968705217398266,
+        "12": 0.0018093171829091578,
+        "13": 0.0004563322098487699,
+        "14": 4.0029141214804375e-05
+      },
+      "mean_duration_ms": 102819.66793425614,
+      "long_view_rate": 0.313284070803545
+    },
+    "test": {
+      "tab_share": {
+        "0": 0.08410908152976762,
+        "1": 0.7670000234483082,
+        "2": 0.030711421670926442,
+        "3": 0.00154172626445002,
+        "4": 0.05723732032733838,
+        "5": 0.002790348676343002,
+        "6": 0.0465683400942622,
+        "7": 0.0005100007034492462,
+        "8": 0.004754144488475156,
+        "9": 0.000586207705114076,
+        "10": 0.0002462072361479119,
+        "11": 0.001096208408563322,
+        "12": 0.002415175745069993,
+        "13": 0.00034586254601730483,
+        "14": 8.79311557671114e-05
+      },
+      "mean_duration_ms": 107210.06124698103,
+      "long_view_rate": 0.31345112200154757
+    }
+  },
+  "data_quality_flags": [
+    {
+      "file": "user_features_pure.csv",
+      "column": "is_live_streamer",
+      "issue": "21127 row(s) have a negative value in what looks like a non-negative count/flag column -- likely a sentinel/missing-value code, not a real value",
+      "example_values": [
+        -124.0
+      ]
+    }
+  ],
+  "side_files_available_but_not_yet_used_by_data_py": {
+    "user_features_pure.csv": {
+      "rows": 27285,
+      "columns": [
+        "user_id",
+        "user_active_degree",
+        "is_lowactive_period",
+        "is_live_streamer",
+        "is_video_author",
+        "follow_user_num",
+        "follow_user_num_range",
+        "fans_user_num",
+        "fans_user_num_range",
+        "friend_user_num",
+        "friend_user_num_range",
+        "register_days",
+        "register_days_range",
+        "onehot_feat0",
+        "onehot_feat1",
+        "onehot_feat2",
+        "onehot_feat3",
+        "onehot_feat4",
+        "onehot_feat5",
+        "onehot_feat6",
+        "onehot_feat7",
+        "onehot_feat8",
+        "onehot_feat9",
+        "onehot_feat10",
+        "onehot_feat11",
+        "onehot_feat12",
+        "onehot_feat13",
+        "onehot_feat14",
+        "onehot_feat15",
+        "onehot_feat16",
+        "onehot_feat17"
+      ]
+    },
+    "video_features_basic_pure.csv": {
+      "rows": 7583,
+      "columns": [
+        "video_id",
+        "author_id",
+        "video_type",
+        "upload_dt",
+        "upload_type",
+        "visible_status",
+        "video_duration",
+        "server_width",
+        "server_height",
+        "music_id",
+        "music_type",
+        "tag"
+      ]
+    }
+  },
+  "leakage_columns_excluded_from_raw_features": [
+    "play_time_ms",
+    "profile_stay_time",
+    "comment_stay_time",
+    "is_click",
+    "is_like",
+    "is_follow",
+    "is_comment",
+    "is_forward",
+    "is_hate",
+    "is_profile_enter"
+  ]
+}

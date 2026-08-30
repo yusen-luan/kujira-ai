@@ -1,0 +1,70 @@
+{
+  "iter": 2,
+  "status": "rejected",
+  "hypothesis": "Add a per-row \"user historical long_view rate\" feature \u2014 for each impression, the smoothed rate of the user's own long_view outcomes over strictly prior (time-ordered) impressions only, bucketized into deciles \u2014 as a new categorical FM field. This is the legitimate aggregated-historical-outcome pattern explicitly allowed by the leakage rule, and unlike last iteration's static demographic fields (which added many high-cardinality categories and overfit by epoch 4), this is a single low-cardinality (10-bucket) field carrying strong, genuinely time-safe personalization signal that should generalize better.",
+  "reflection": "",
+  "expected_effect": "GAUC should move more than nDCG@5, since this feature's main value is letting FM's pairwise interactions modulate video/tab scoring differently for behaviorally distinct user segments (chronically-high vs chronically-low long-view users), which sharpens within-user relative ranking \u2014 the exact quantity GAUC measures \u2014 more than it shifts the cross-user absolute score calibration that nDCG@5's top-of-list selection depends on.",
+  "changed_files": [
+    "data.py"
+  ],
+  "sweep": null,
+  "metrics": {
+    "valid": {
+      "GAUC": 0.6612263359501286,
+      "nDCG@5": 0.5325922827390296,
+      "primary": 0.5969093093445791,
+      "users": 22377,
+      "rows": 124909
+    },
+    "test": {
+      "GAUC": 0.6538388088293178,
+      "nDCG@5": 0.5224825417270011,
+      "primary": 0.5881606752781594,
+      "users": 23875,
+      "rows": 170588
+    }
+  },
+  "prev_metrics": {
+    "valid": {
+      "GAUC": 0.6671326321610643,
+      "nDCG@5": 0.5358048805448711,
+      "primary": 0.6014687563529677,
+      "users": 22377,
+      "rows": 124909
+    },
+    "test": {
+      "GAUC": 0.6621228758829982,
+      "nDCG@5": 0.5285584577777603,
+      "primary": 0.5953406668303793,
+      "users": 23875,
+      "rows": 170588
+    }
+  },
+  "training_curve": {
+    "n_epochs_logged": 12,
+    "first_epoch_primary": 0.5719,
+    "best_epoch": 8,
+    "best_epoch_primary": 0.5969,
+    "last_epoch": 12,
+    "last_epoch_primary": 0.5934,
+    "early_stopped": true,
+    "degraded_after_best": true,
+    "still_improving_at_cutoff": false
+  },
+  "prev_best_primary": 0.6014687563529677,
+  "new_primary": 0.5969093093445791,
+  "llm_calls": [
+    {
+      "cost_usd": 0.1479124,
+      "ok": true,
+      "error": null
+    }
+  ],
+  "run_attempts": [
+    {
+      "attempt": 0,
+      "ok": true,
+      "error": null
+    }
+  ]
+}

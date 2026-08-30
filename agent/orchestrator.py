@@ -42,6 +42,7 @@ State on disk:
     logs/node_N.json          full record of that node (deliverable #3)
 """
 import argparse
+import concurrent.futures
 import json
 import queue
 import re
@@ -58,6 +59,8 @@ import eda
 import llm
 import prompt_templates as pt
 import rag
+import repo_explore
+import web_research
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 WORKSPACE = REPO_ROOT / 'workspace'
@@ -120,6 +123,68 @@ def node0_label(best_dir):
     is_pristine = all((best_dir / f).read_text(encoding='utf-8') == (WORKSPACE / f).read_text(encoding='utf-8')
                        for f in pt.ALLOWED_FILES)
     return 'baseline' if is_pristine else 'last best'
+
+
+LOGS_BACKUP_DIR = LOGS_DIR / 'backup'
+RUNS_BACKUP_DIR = RUNS_DIR / 'backup'
+
+
+def archive_prior_run():
+    """--no-resume used to just delete the previous run's state (reset_best_dir() +
+    clear_prior_logs() below), which silently destroyed it -- easy to do by accident
+    when reaching for --no-resume specifically to get a clean pristine-baseline test.
+    Now: move everything --no-resume is about to reset into timestamped backup folders
+    instead of deleting it, so a fresh test run never costs you the previous run's
+    results. Both logs/ and agent/runs/ get their OWN backup/<timestamp>/ folder
+    (rather than nesting one inside the other) so each stays organized under the
+    directory it actually belongs to; both are already fully covered by .gitignore
+    (`logs/*` / `agent/runs/`), so nothing extra needs to be added there.
+
+    logs/backup/<timestamp>/       <- every logs/node_*.json (including node_0.json)
+    agent/runs/backup/<timestamp>/ <- best/, node_*/, node_0_metrics.json,
+                                       probe_findings.md, web_literature/,
+                                       literature_context.md
+
+    Deliberately does NOT touch agent/runs/{eda_report.json, eda_summary.md} -- those
+    are axis-agnostic and expensive-ish to regenerate (one LLM call), not part of what
+    a "fresh run" means to reset (see ensure_eda()). literature_context.md IS moved
+    despite being similarly cheap-to-regenerate, specifically because a truly fresh/
+    pristine run's literature grounding shouldn't silently carry over web-research
+    notes found by the run being archived away -- ensure_literature() regenerates it
+    from agent/literature/ alone (cheap, local BM25, no LLM cost) the moment it finds
+    the cached file gone.
+
+    Returns (logs_backup_dir, runs_backup_dir), or (None, None) if there was nothing
+    worth archiving (a genuinely first-ever run)."""
+    prior_node_logs = sorted(LOGS_DIR.glob('node_*.json')) if LOGS_DIR.exists() else []
+    have_real_iterations = any(p.stem != 'node_0' for p in prior_node_logs)
+    best_path = RUNS_DIR / 'best'
+    # best/ always exists after any run, pristine or not -- checking mere existence would
+    # never let this be a no-op on an already-fresh state, so check divergence instead,
+    # the same way node0_label() decides whether best/ still matches workspace/.
+    have_diverged_best = best_path.exists() and node0_label(best_path) != 'baseline'
+    if not have_real_iterations and not have_diverged_best:
+        return None, None
+
+    stamp = time.strftime('%Y%m%d_%H%M%S')
+    logs_dest = LOGS_BACKUP_DIR / stamp
+    runs_dest = RUNS_BACKUP_DIR / stamp
+
+    if prior_node_logs:
+        logs_dest.mkdir(parents=True, exist_ok=True)
+        for p in prior_node_logs:
+            shutil.move(str(p), str(logs_dest / p.name))
+
+    to_move = ['best', 'node_0_metrics.json', 'probe_findings.md', 'web_literature',
+               'literature_context.md']
+    to_move += [p.name for p in RUNS_DIR.glob('node_*') if p.is_dir()]
+    to_move = [name for name in to_move if (RUNS_DIR / name).exists()]
+    if to_move:
+        runs_dest.mkdir(parents=True, exist_ok=True)
+        for name in to_move:
+            shutil.move(str(RUNS_DIR / name), str(runs_dest / name))
+
+    return (logs_dest if prior_node_logs else None), (runs_dest if to_move else None)
 
 
 def clear_prior_logs():
@@ -287,16 +352,24 @@ def run_probe_candidate(probe_dir, data_dir, out_path, timeout):
     return {'ok': True, 'result': result}
 
 
-def call_llm_with_retry(system_prompt, user_prompt, model, max_budget_usd, label, retries=1):
+def call_llm_with_retry(system_prompt, user_prompt, model, max_budget_usd, label, retries=1,
+                         timeout=llm.DEFAULT_TIMEOUT_S):
+    """timeout defaults to llm.py's fixed 180s if not passed explicitly -- but every real
+    call site should pass args.propose_timeout, since the propose/repair prompt grows
+    with the run (more history, more literature notes, the lever-category taxonomy) and
+    a fixed 180s that was fine at node 1 can start timing out by node 14+ purely from
+    prompt size, not any actual problem with the call."""
     t0 = display.llm_call_start(label)
-    attempt = llm.call_claude(system_prompt, user_prompt, model=model, max_budget_usd=max_budget_usd)
+    attempt = llm.call_claude(system_prompt, user_prompt, model=model, max_budget_usd=max_budget_usd,
+                               timeout=timeout)
     display.llm_call_end(t0, attempt)
     tries = [attempt]
     while not attempt['ok'] and retries > 0:
         retries -= 1
         display.retrying()
         t0 = display.llm_call_start(label)
-        attempt = llm.call_claude(system_prompt, user_prompt, model=model, max_budget_usd=max_budget_usd)
+        attempt = llm.call_claude(system_prompt, user_prompt, model=model, max_budget_usd=max_budget_usd,
+                                   timeout=timeout)
         display.llm_call_end(t0, attempt)
         tries.append(attempt)
     return attempt, tries
@@ -334,15 +407,26 @@ def load_prior_history():
         entry = {'iter': record.get('iter', node_num), 'status': status}
         if status in ('accepted', 'rejected'):
             entry.update(hypothesis=record.get('hypothesis'), reflection=record.get('reflection'),
-                         expected_effect=record.get('expected_effect'), metrics=record.get('metrics'),
+                         expected_effect=record.get('expected_effect'), lever_category=record.get('lever_category'),
+                         metrics=record.get('metrics'),
                          prev_metrics=record.get('prev_metrics'), training_curve=record.get('training_curve'),
                          primary=record.get('new_primary'), prev_best=record.get('prev_best_primary'),
-                         sweep=record.get('sweep'))
+                         sweep=record.get('sweep'), variants=record.get('variants'),
+                         winning_variant=record.get('winning_variant'))
         elif status == 'answered':
             entry.update(question=record.get('question'), reflection=record.get('reflection'))
         elif status == 'failed':
             entry.update(hypothesis=record.get('hypothesis'), question=record.get('question'),
-                         error_summary=record.get('error_summary'))
+                         error_summary=record.get('error_summary'), lever_category=record.get('lever_category'),
+                         variants=record.get('variants'))
+        elif status == 'researched':
+            entry.update(research_question=record.get('research_question'),
+                         reflection=record.get('reflection'),
+                         note_title=(record.get('note') or {}).get('title'))
+        elif status in ('research_failed', 'research_denied'):
+            entry.update(research_question=record.get('research_question'),
+                         reflection=record.get('reflection'),
+                         rejected_reason=record.get('rejected_reason'))
         else:
             continue
         entries.append(entry)
@@ -373,7 +457,8 @@ def run_and_repair(node_id, iter_dir, hypothesis, args, llm_calls, hparams_overr
         repair_prompt = pt.build_repair_prompt(read_code(iter_dir), hypothesis, result['error'])
         attempt, tries = call_llm_with_retry(pt.SYSTEM_PROMPT, repair_prompt, args.model, args.max_budget_usd,
                                               label=f'repairing candidate after run failure '
-                                                    f'({repairs_left + 1} attempt(s) left)')
+                                                    f'({repairs_left + 1} attempt(s) left)',
+                                              timeout=args.propose_timeout)
         llm_calls.extend({'cost_usd': t.get('cost_usd'), 'ok': t['ok'], 'error': t.get('error')} for t in tries)
         if not attempt['ok']:
             run_attempts.append({'attempt': len(run_attempts), 'ok': False,
@@ -425,6 +510,97 @@ def run_sweep(node_id, iter_dir, hypothesis, args, llm_calls, sweep_param, sweep
     return best_result if best_result is not None else first_result, best_value, trials, run_attempts
 
 
+def run_parallel_variants(node_id, best_dir, variants, args):
+    """Runs every variant from a `parallel_hypothesis` propose turn concurrently (each
+    its own subprocess -- run_candidate() already shells out via stream_subprocess, so
+    running several from different threads is just several independent OS processes,
+    no shared interpreter state to worry about). Deliberately NO repair-retry per
+    variant (unlike run_and_repair) -- with several variants in flight, retrying every
+    failing one would multiply LLM cost by the variant count for what's supposed to be
+    a cheap way to explore several ideas at once; a variant that fails just loses the
+    race. Per-epoch live streaming is suppressed (verbose=False) since interleaving
+    several variants' epoch lines on one terminal would be illegible -- a one-line
+    summary per variant is printed as each finishes instead.
+
+    Returns (variant_dirs, results, best_index, best_result) where variant_dirs[i] is
+    the candidate directory for variants[i], results[i] is that variant's
+    run_candidate()-shaped dict, and best_index/best_result identify whichever variant
+    had the highest valid primary among the ones that ran successfully (best_index is
+    None if every variant failed)."""
+    variant_dirs = []
+    for i in range(len(variants)):
+        vdir = RUNS_DIR / f'node_{node_id}_v{i + 1}'
+        if vdir.exists():
+            shutil.rmtree(vdir)
+        vdir.mkdir(parents=True)
+        for fname in pt.ALLOWED_FILES:
+            shutil.copy2(best_dir / fname, vdir / fname)
+        apply_files(vdir, variants[i]['files'])
+        variant_dirs.append(vdir)
+
+    hparams = {'k': args.k, 'lr': args.lr, 'epochs': args.epochs}
+    results = [None] * len(variants)
+
+    def _run_one(i):
+        metrics_path = variant_dirs[i] / 'metrics.json'
+        t0 = time.time()
+        r = run_candidate(variant_dirs[i], args.data_dir, metrics_path, hparams, args.seed,
+                           args.run_timeout, verbose=False)
+        r['elapsed_s'] = time.time() - t0
+        return i, r
+
+    display.phase(f'running {len(variants)} variants in parallel (per-epoch output suppressed '
+                  f'for legibility -- see logs/node_{node_id}.json for full detail after)...')
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(variants)) as ex:
+        for fut in concurrent.futures.as_completed([ex.submit(_run_one, i) for i in range(len(variants))]):
+            i, r = fut.result()
+            results[i] = r
+            if r['ok']:
+                display.phase(f'  variant {i + 1}: ok in {r["elapsed_s"]:.0f}s -- '
+                              f'valid primary {r["metrics"]["valid"]["primary"]:.4f}')
+            else:
+                display.phase(f'  variant {i + 1}: FAILED in {r["elapsed_s"]:.0f}s -- '
+                              f'{(r.get("error") or "")[:120]}')
+
+    best_i, best_result = None, None
+    for i, r in enumerate(results):
+        if r['ok'] and (best_result is None or r['metrics']['valid']['primary'] > best_result['metrics']['valid']['primary']):
+            best_i, best_result = i, r
+    return variant_dirs, results, best_i, best_result
+
+
+def run_variant_sweep(node_id, variant_dir, args, sweep_param, sweep_values, base_result):
+    """Hyperparameter sweep applied ONLY to whichever variant already won the initial
+    parallel race, per the user's framing: sweeping is a refinement of an already-chosen
+    mechanism, not a way to choose between mechanisms, so there's no point spending it on
+    variants that already lost. `base_result` is that variant's already-computed
+    run_candidate()-shaped result at plain default hyperparameters (from the initial
+    race) -- counted as one trial alongside the swept values, not re-run. No
+    repair-retry for any sweep value, unlike run_sweep()'s first trial: this code is
+    already proven to run (it's how it won the race in the first place), so a failing
+    sweep value is a bad hyperparameter, not a bug worth an LLM repair call.
+    Returns (best_result, best_value, trials) -- trials includes a leading 'default'
+    entry for base_result plus one entry per swept value."""
+    base_hparams = {'k': args.k, 'lr': args.lr, 'epochs': args.epochs}
+    metrics_path = variant_dir / 'metrics.json'
+    trials = [{'value': 'default', 'ok': True, 'primary': base_result['metrics']['valid']['primary'],
+               'error': None}]
+    best_result, best_value = base_result, 'default'
+    for value in sweep_values:
+        display.run_start(f'candidate (node {node_id}, winning variant, {sweep_param}={value})',
+                           args.run_timeout)
+        t0 = time.time()
+        r = run_candidate(variant_dir, args.data_dir, metrics_path, {**base_hparams, sweep_param: value},
+                           args.seed, args.run_timeout, verbose=not args.quiet)
+        display.run_end(t0, r['ok'], timed_out=r.get('timed_out', False))
+        trials.append({'value': value, 'ok': r['ok'],
+                        'primary': r['metrics']['valid']['primary'] if r['ok'] else None,
+                        'error': None if r['ok'] else r.get('error')})
+        if r['ok'] and r['metrics']['valid']['primary'] > best_result['metrics']['valid']['primary']:
+            best_result, best_value = r, value
+    return best_result, best_value, trials
+
+
 def run_probe_and_repair(probe_dir, question, args, llm_calls):
     """Same retry-with-traceback-feedback pattern as run_and_repair, pointed at a
     probe.py instead of data.py/baseline.py. Returns (result, run_attempts)."""
@@ -442,7 +618,8 @@ def run_probe_and_repair(probe_dir, question, args, llm_calls):
         current_probe = {'probe.py': (probe_dir / 'probe.py').read_text(encoding='utf-8')}
         repair_prompt = pt.build_repair_prompt(current_probe, question, result['error'])
         attempt, tries = call_llm_with_retry(pt.SYSTEM_PROMPT, repair_prompt, args.model, args.max_budget_usd,
-                                              label=f'repairing probe after run failure ({repairs_left + 1} left)')
+                                              label=f'repairing probe after run failure ({repairs_left + 1} left)',
+                                              timeout=args.propose_timeout)
         llm_calls.extend({'cost_usd': t.get('cost_usd'), 'ok': t['ok'], 'error': t.get('error')} for t in tries)
         if not attempt['ok']:
             run_attempts.append({'attempt': len(run_attempts), 'ok': False,
@@ -467,18 +644,87 @@ def append_probe_finding(node_id, question, result):
         f.write(block)
 
 
-def run_iteration(node_id, best_dir, best_primary, prev_metrics, history, args, streak):
+def current_best_lever_category(history):
+    """The lever_category of whichever node is currently accepted, or None if that
+    node predates LEVER_CATEGORY tracking (true for the earliest accepts in this
+    project) or nothing has been accepted yet."""
+    for h in reversed(history):
+        if h.get('status') == 'accepted':
+            return h.get('lever_category')
+    return None
+
+
+def best_alternate_candidate_code(history):
+    """Full code of a past candidate that ISN'T the current accepted best, so an
+    'ensembling' hypothesis can reuse it verbatim instead of re-deriving it from a text
+    description in history -- the propose LLM has no filesystem access of its own
+    (--tools ""), so without this it would have to reimplement a past mechanism from
+    memory, reintroducing exactly the bug risk ensembling is supposed to avoid by
+    reusing already-validated code.
+
+    Prefers the highest-scoring alternate whose lever_category DIFFERS from the current
+    best's -- node 17 ensembled two candidates from the SAME category (plain BPR-FM +
+    the same FM's auxiliary-head variant) and saw essentially no gain (0.6039 either
+    way), because near-identical mechanisms make near-identical errors; diversity of
+    mechanism, not just a high individual score, is what makes averaging actually
+    reduce variance. Falls back to the plain highest-scoring alternate if the current
+    best's category is unknown (true for nodes accepted before this tracking existed)
+    or no differently-categorized alternate has code on disk.
+
+    Excludes past 'ensembling' attempts from the candidate pool entirely -- once node 17
+    existed and outscored node 14 individually, a naive highest-score fallback started
+    suggesting "reuse node 17's code" as the ensembling partner, which is circular
+    (offering an already-combined candidate as the fresh single mechanism to combine
+    with next) rather than useful.
+
+    Returns (node_id, code_dict) or (None, None) if no candidate exists on disk at all
+    (e.g. the top scorer IS the current best, or its node_N/ dir was cleaned up).
+    Bounded to at most one extra file pair regardless of run length -- doesn't
+    reintroduce the unbounded per-node growth the history-windowing fix addressed."""
+    best_category = current_best_lever_category(history)
+    alternates = [h for h in pt.top_candidates(history, top_k=10)
+                  if h.get('status') != 'accepted' and h.get('lever_category') != 'ensembling']
+
+    def _code_if_on_disk(h):
+        node_dir = RUNS_DIR / f"node_{h['iter']}"
+        if (node_dir / 'data.py').exists() and (node_dir / 'baseline.py').exists():
+            return h['iter'], read_code(node_dir)
+        return None
+
+    if best_category:
+        for h in alternates:
+            if h.get('lever_category') and h['lever_category'] != best_category:
+                found = _code_if_on_disk(h)
+                if found:
+                    return found
+
+    for h in alternates:
+        found = _code_if_on_disk(h)
+        if found:
+            return found
+    return None, None
+
+
+def run_iteration(node_id, best_dir, best_primary, prev_metrics, history, args, streak,
+                   web_research_remaining, explore_remaining):
     """One node of the single iteration chain. Proposes; the LLM itself picks a
-    hypothesis+code-change turn or a probe turn. Accepts a hypothesis into `best_dir`
+    hypothesis+code-change turn, a probe turn, a web-research turn, or a repo-explore
+    turn (budget permitting for the latter two). Accepts a hypothesis into `best_dir`
     (in place) on improvement. Returns (status, new_best_primary, new_best_metrics,
-    history_entry). status is one of accepted/rejected/answered/failed."""
+    history_entry). status is one of accepted/rejected/answered/failed/researched/
+    research_failed/research_denied/explored/explore_failed/explore_denied."""
     best_code = read_code(best_dir)
+    alt_node_id, alt_code = best_alternate_candidate_code(history)
     propose_prompt = pt.build_propose_prompt(best_code, history, best_primary, streak,
-                                              args.escalate_after, args.converge_eps)
+                                              args.escalate_after, args.converge_eps,
+                                              web_research_remaining=web_research_remaining,
+                                              explore_remaining=explore_remaining,
+                                              alt_node_id=alt_node_id, alt_code=alt_code)
     llm_calls = []
 
     attempt, tries = call_llm_with_retry(pt.SYSTEM_PROMPT, propose_prompt, args.model, args.max_budget_usd,
-                                          label='deciding the next move (hypothesis or probe)')
+                                          label='deciding the next move (hypothesis or probe)',
+                                          timeout=args.propose_timeout)
     llm_calls.extend({'cost_usd': t.get('cost_usd'), 'ok': t['ok'], 'error': t.get('error')} for t in tries)
     if not attempt['ok']:
         record = {'iter': node_id, 'status': 'failed', 'hypothesis': None,
@@ -523,17 +769,158 @@ def run_iteration(node_id, best_dir, best_primary, prev_metrics, history, args, 
         return 'answered', best_primary, prev_metrics, {'iter': node_id, 'status': 'answered',
                                                           'question': question, 'reflection': reflection}
 
+    if parsed['mode'] == 'research':
+        question = parsed['research_question']
+        display.field('research question', question)
+
+        if web_research_remaining <= 0:
+            record = {'iter': node_id, 'status': 'research_denied', 'research_question': question,
+                       'reflection': reflection, 'llm_calls': llm_calls}
+            write_log(node_id, record)
+            return ('research_denied', best_primary, prev_metrics,
+                    {'iter': node_id, 'status': 'research_denied', 'research_question': question,
+                     'reflection': reflection})
+
+        result = web_research.run_research(question, node_id, model=args.model,
+                                            max_budget_usd=args.max_budget_usd,
+                                            timeout=args.web_research_timeout)
+        llm_calls.append({'cost_usd': result['cost_usd'], 'ok': result['ok'],
+                           'error': None if result['ok'] else result['rejected_reason']})
+
+        if result['ok']:
+            display.field('research result', f"found: {result['note']['title']} ({result['note']['source_url']})")
+            rag.run()  # regenerate literature_context.md so the new note is visible next propose call
+            record = {'iter': node_id, 'status': 'researched', 'research_question': question,
+                       'reflection': reflection, 'note': result['note'], 'saved_path': result['saved_path'],
+                       'llm_calls': llm_calls}
+            write_log(node_id, record)
+            return ('researched', best_primary, prev_metrics,
+                    {'iter': node_id, 'status': 'researched', 'research_question': question,
+                     'reflection': reflection, 'note_title': result['note']['title']})
+
+        display.field('research result', f"none found ({result['rejected_reason']})")
+        record = {'iter': node_id, 'status': 'research_failed', 'research_question': question,
+                   'reflection': reflection, 'rejected_reason': result['rejected_reason'],
+                   'llm_calls': llm_calls}
+        write_log(node_id, record)
+        return ('research_failed', best_primary, prev_metrics,
+                {'iter': node_id, 'status': 'research_failed', 'research_question': question,
+                 'reflection': reflection})
+
+    if parsed['mode'] == 'explore':
+        question = parsed['explore_question']
+        display.field('explore question', question)
+
+        if explore_remaining <= 0:
+            record = {'iter': node_id, 'status': 'explore_denied', 'explore_question': question,
+                       'reflection': reflection, 'llm_calls': llm_calls}
+            write_log(node_id, record)
+            return ('explore_denied', best_primary, prev_metrics,
+                    {'iter': node_id, 'status': 'explore_denied', 'explore_question': question,
+                     'reflection': reflection})
+
+        result = repo_explore.run_explore(question, node_id, model=args.model,
+                                           max_budget_usd=args.max_budget_usd,
+                                           timeout=args.explore_timeout)
+        llm_calls.append({'cost_usd': result['cost_usd'], 'ok': result['ok'],
+                           'error': None if result['ok'] else result['rejected_reason']})
+
+        if result['ok']:
+            display.field('explore result', f"found: {result['note']['title']} ({result['note']['citation']})")
+            rag.run()  # regenerate literature_context.md so the new note is visible next propose call
+            record = {'iter': node_id, 'status': 'explored', 'explore_question': question,
+                       'reflection': reflection, 'note': result['note'], 'saved_path': result['saved_path'],
+                       'llm_calls': llm_calls}
+            write_log(node_id, record)
+            return ('explored', best_primary, prev_metrics,
+                    {'iter': node_id, 'status': 'explored', 'explore_question': question,
+                     'reflection': reflection, 'note_title': result['note']['title']})
+
+        display.field('explore result', f"none found ({result['rejected_reason']})")
+        record = {'iter': node_id, 'status': 'explore_failed', 'explore_question': question,
+                   'reflection': reflection, 'rejected_reason': result['rejected_reason'],
+                   'llm_calls': llm_calls}
+        write_log(node_id, record)
+        return ('explore_failed', best_primary, prev_metrics,
+                {'iter': node_id, 'status': 'explore_failed', 'explore_question': question,
+                 'reflection': reflection})
+
+    if parsed['mode'] == 'parallel_hypothesis':
+        variants = parsed['variants']
+        display.field('parallel variants', '; '.join(
+            f"[{i + 1}] ({v['lever_category']}) {v['hypothesis'][:60]}" for i, v in enumerate(variants)))
+
+        variant_dirs, results, best_i, best_result = run_parallel_variants(node_id, best_dir, variants, args)
+
+        variant_records = [
+            {'variant': i + 1, 'hypothesis': v['hypothesis'], 'expected_effect': v['expected_effect'],
+             'lever_category': v['lever_category'], 'ok': r['ok'],
+             'metrics': r.get('metrics') if r['ok'] else None,
+             'error': None if r['ok'] else r.get('error')}
+            for i, (v, r) in enumerate(zip(variants, results))
+        ]
+
+        if best_result is None:
+            hyp_summary = f'{len(variants)} parallel variants, all failed'
+            record = {'iter': node_id, 'status': 'failed', 'hypothesis': hyp_summary,
+                       'reflection': reflection, 'variants': variant_records,
+                       'error_summary': 'every parallel variant failed to run',
+                       'llm_calls': llm_calls, 'run_attempts': []}
+            write_log(node_id, record)
+            return ('failed', best_primary, prev_metrics,
+                    {'iter': node_id, 'status': 'failed', 'hypothesis': hyp_summary,
+                     'error_summary': 'every parallel variant failed to run'})
+
+        winning_hypothesis = variants[best_i]['hypothesis']
+        winning_expected_effect = variants[best_i]['expected_effect']
+        winning_lever_category = variants[best_i]['lever_category']
+        sweep = None
+        win_sweep_param, win_sweep_values = variants[best_i]['sweep_param'], variants[best_i]['sweep_values']
+        if win_sweep_param:
+            display.field('sweeping winner', f'v{best_i + 1} over {win_sweep_param}={win_sweep_values}')
+            best_result, best_value, trials = run_variant_sweep(
+                node_id, variant_dirs[best_i], args, win_sweep_param, win_sweep_values, best_result)
+            sweep = {'param': win_sweep_param, 'trials': trials, 'best_value': best_value}
+
+        new_primary = best_result['metrics']['valid']['primary']
+        if new_primary > best_primary + args.converge_eps:
+            for fname in pt.ALLOWED_FILES:
+                shutil.copy2(variant_dirs[best_i] / fname, best_dir / fname)
+            status, out_best, out_metrics = 'accepted', new_primary, best_result['metrics']
+        else:
+            status, out_best, out_metrics = 'rejected', best_primary, prev_metrics
+
+        record = {'iter': node_id, 'status': status, 'hypothesis': winning_hypothesis,
+                   'reflection': reflection, 'expected_effect': winning_expected_effect,
+                   'lever_category': winning_lever_category,
+                   'changed_files': list(variants[best_i]['files'].keys()), 'variants': variant_records,
+                   'winning_variant': best_i + 1, 'sweep': sweep, 'metrics': best_result['metrics'],
+                   'prev_metrics': prev_metrics, 'training_curve': best_result.get('training_curve'),
+                   'prev_best_primary': best_primary, 'new_primary': new_primary,
+                   'llm_calls': llm_calls, 'run_attempts': []}
+        write_log(node_id, record)
+        return (status, out_best, out_metrics,
+                {'iter': node_id, 'status': status, 'hypothesis': winning_hypothesis, 'reflection': reflection,
+                 'expected_effect': winning_expected_effect, 'lever_category': winning_lever_category,
+                 'sweep': sweep, 'metrics': best_result['metrics'],
+                 'prev_metrics': prev_metrics, 'training_curve': best_result.get('training_curve'),
+                 'primary': new_primary, 'prev_best': best_primary, 'variants': variant_records,
+                 'winning_variant': best_i + 1})
+
     # hypothesis mode
     hypothesis, expected_effect, files = parsed['hypothesis'], parsed['expected_effect'], parsed['files']
+    lever_category = parsed['lever_category']
     sweep_param, sweep_values = parsed['sweep_param'], parsed['sweep_values']
     display.field('hypothesis', hypothesis)
     display.field('expected effect', expected_effect)
+    display.field('lever category', lever_category)
     if sweep_param:
         display.field('sweep', f'{sweep_param} over {sweep_values}')
     changed = [f for f in files if f in pt.ALLOWED_FILES]
     if not changed:
         record = {'iter': node_id, 'status': 'failed', 'hypothesis': hypothesis,
                    'reflection': reflection, 'expected_effect': expected_effect,
+                   'lever_category': lever_category,
                    'error_summary': 'no valid file changes parsed from LLM response',
                    'raw_response': attempt['text'][:2000], 'llm_calls': llm_calls, 'run_attempts': []}
         write_log(node_id, record)
@@ -552,7 +939,8 @@ def run_iteration(node_id, best_dir, best_primary, prev_metrics, history, args, 
 
     if not result['ok']:
         record = {'iter': node_id, 'status': 'failed', 'hypothesis': hypothesis,
-                   'reflection': reflection, 'expected_effect': expected_effect, 'changed_files': changed,
+                   'reflection': reflection, 'expected_effect': expected_effect,
+                   'lever_category': lever_category, 'changed_files': changed,
                    'sweep': sweep, 'error_summary': result['error'], 'llm_calls': llm_calls,
                    'run_attempts': run_attempts}
         write_log(node_id, record)
@@ -568,14 +956,16 @@ def run_iteration(node_id, best_dir, best_primary, prev_metrics, history, args, 
         status, out_best, out_metrics = 'rejected', best_primary, prev_metrics
 
     record = {'iter': node_id, 'status': status, 'hypothesis': hypothesis,
-              'reflection': reflection, 'expected_effect': expected_effect, 'changed_files': changed,
+              'reflection': reflection, 'expected_effect': expected_effect,
+              'lever_category': lever_category, 'changed_files': changed,
               'sweep': sweep, 'metrics': result['metrics'], 'prev_metrics': prev_metrics,
               'training_curve': result.get('training_curve'),
               'prev_best_primary': best_primary, 'new_primary': new_primary,
               'llm_calls': llm_calls, 'run_attempts': run_attempts}
     write_log(node_id, record)
     return status, out_best, out_metrics, {'iter': node_id, 'status': status, 'hypothesis': hypothesis,
-                               'reflection': reflection, 'expected_effect': expected_effect, 'sweep': sweep,
+                               'reflection': reflection, 'expected_effect': expected_effect,
+                               'lever_category': lever_category, 'sweep': sweep,
                                'metrics': result['metrics'], 'prev_metrics': prev_metrics,
                                'training_curve': result.get('training_curve'),
                                'primary': new_primary, 'prev_best': best_primary}
@@ -588,6 +978,12 @@ def main():
     ap.add_argument('--max_repairs', type=int, default=2, help='error-repair attempts per node')
     ap.add_argument('--run_timeout', type=int, default=400,
                      help='seconds before any candidate run is killed (covers both numpy and torch candidates)')
+    ap.add_argument('--propose_timeout', type=int, default=300,
+                     help='seconds before a propose/repair LLM call is killed (was hardcoded to '
+                          'llm.py\'s 180s default with no override -- raised and exposed here because '
+                          'the propose prompt grows with the run (more history, more literature notes, '
+                          'the lever-category taxonomy), so a timeout fine at node 1 can start failing '
+                          'purely from prompt size by node 10+, not any actual problem with the call)')
     ap.add_argument('--model', default='sonnet')
     ap.add_argument('--max_budget_usd', type=float, default=0.50)
     ap.add_argument('--k', type=int, default=16)
@@ -603,6 +999,19 @@ def main():
                           'prompt explicitly pushes for a structurally different idea (or a probe)')
     ap.add_argument('--probe_timeout', type=int, default=90,
                      help='seconds before a diagnostic probe run is killed')
+    ap.add_argument('--web_research_budget', type=int, default=2,
+                     help='max live web-research calls for this run (separate pool from '
+                          '--iterations, like the old --diagnosis_budget) -- 0 disables the '
+                          'RESEARCH_QUESTION option entirely')
+    ap.add_argument('--web_research_timeout', type=int, default=120,
+                     help='seconds before a web-research LLM call is killed')
+    ap.add_argument('--explore_budget', type=int, default=2,
+                     help='max repo-explore calls for this run (separate pool from --iterations '
+                          'and from --web_research_budget) -- 0 disables the EXPLORE_QUESTION '
+                          'option entirely')
+    ap.add_argument('--explore_timeout', type=int, default=90,
+                     help='seconds before a repo-explore LLM call is killed (read-only local '
+                          'Read/Grep/Glob, so shorter than the web-research default)')
     ap.add_argument('--converge_eps', type=float, default=0.002,
                      help='official convergence epsilon: stop early once no node improves the overall '
                           'best primary by more than this over --converge_n consecutive nodes')
@@ -629,8 +1038,13 @@ def main():
     if args.resume:
         best_dir = ensure_best_dir()
     else:
+        logs_backup, runs_backup = archive_prior_run()
+        if logs_backup or runs_backup:
+            display.phase(f'--no-resume: backed up previous logs to {logs_backup}, '
+                           f'previous agent/runs state to {runs_backup}')
         best_dir = reset_best_dir()
-        clear_prior_logs()
+        clear_prior_logs()  # defensive no-op in the common case -- archive_prior_run() already
+                             # moved every logs/node_*.json (N>=1) out, this just catches leftovers
 
     label = node0_label(best_dir)
     display.banner(f'node 0: reproducing {label}')
@@ -659,6 +1073,9 @@ def main():
     converged = False
     plateau_streak = 0  # always starts fresh, even when resuming -- only the propose-prompt
                          # history/reflection context carries over, not the escalation pressure
+    web_research_remaining = args.web_research_budget  # a per-invocation budget, like plateau_streak,
+                                                         # not reconstructed from prior sessions' spend
+    explore_remaining = args.explore_budget  # same per-invocation-only accounting as web_research_remaining
     if history:
         display.phase(f'loaded {len(history)} prior iteration(s) from {LOGS_DIR} '
                        f'(plateau streak reset to 0); this run continues at node {node_id}')
@@ -672,14 +1089,24 @@ def main():
             break
         display.banner(f'node {node_id}')
         status, best_primary, best_metrics, entry = run_iteration(
-            node_id, best_dir, best_primary, best_metrics, history, args, plateau_streak)
+            node_id, best_dir, best_primary, best_metrics, history, args, plateau_streak,
+            web_research_remaining, explore_remaining)
         history.append(entry)
+
+        if status in ('researched', 'research_failed'):
+            web_research_remaining -= 1  # a denied request never spent a research call
+        if status in ('explored', 'explore_failed'):
+            explore_remaining -= 1  # a denied request never spent an explore call
 
         if status in ('accepted', 'rejected'):
             display.result_line(entry['status'], entry.get('hypothesis'), entry.get('primary'),
                                  entry.get('prev_best'), entry.get('error_summary'))
         elif status == 'answered':
             display.probe_line('answered', entry.get('question'))
+        elif status in ('researched', 'research_failed', 'research_denied'):
+            display.research_line(status, entry.get('research_question'), entry.get('note_title'))
+        elif status in ('explored', 'explore_failed', 'explore_denied'):
+            display.explore_line(status, entry.get('explore_question'), entry.get('note_title'))
         elif entry.get('question') is not None:
             display.probe_line('failed', entry.get('question'))
         else:
