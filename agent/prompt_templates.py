@@ -106,9 +106,12 @@ not an external classifier call):
      which is cheap here specifically.
 
 Plateau escalation (replaces v1's --stuck_after/diagnosis_budget machinery):
-orchestrator.py tracks a plain consecutive-iterations-without-a-real-
-improvement streak (using the *official* epsilon=0.002, not the loose
-accept/reject noise floor) and once it crosses --escalate_after, the propose
+orchestrator.py tracks a plain consecutive-iterations-without-a-*significant*-
+improvement streak (using the official epsilon=--converge_eps). Accept/reject
+is a separate decision from significance -- any node that beats the current
+best at all is accepted into best_dir, regardless of margin, so best_dir
+always holds the actual best-ever score; only whether the margin cleared
+epsilon feeds this streak. Once it crosses --escalate_after, the propose
 prompt gets an explicit "you're plateauing, don't propose a variant of what
 you just tried" instruction, naming the recent hypotheses so the LLM has
 something concrete to diverge from. Probes consume a normal --iterations
@@ -655,7 +658,10 @@ def _format_history_entry(h):
     entries fall inside the full-detail window."""
     status = h['status']
     if h.get('variants'):
-        tag = 'ACCEPTED' if status == 'accepted' else 'rejected (no improvement)'
+        if status == 'accepted':
+            tag = 'ACCEPTED' if h.get('significant') else 'ACCEPTED (insignificant, below epsilon)'
+        else:
+            tag = 'rejected (no improvement)'
         swept_note = ', winner then swept' if h.get('sweep') else ''
         return (f"iter {h['iter']}: {tag} (raced {len(h['variants'])} parallel variants"
                 f"{swept_note}){_format_sweep(h)} "
@@ -665,7 +671,8 @@ def _format_history_entry(h):
     if status == 'accepted':
         cat = f" [{h['lever_category']}]" if h.get('lever_category') else ''
         session_note = ' (via multi-turn coding session)' if h.get('authored_via') == 'code_session' else ''
-        return (f"iter {h['iter']}: ACCEPTED{cat} \"{h['hypothesis']}\"{_format_sweep(h)}{session_note} "
+        sig_note = '' if h.get('significant') else ' (insignificant, below epsilon)'
+        return (f"iter {h['iter']}: ACCEPTED{cat}{sig_note} \"{h['hypothesis']}\"{_format_sweep(h)}{session_note} "
                 f"-> primary {h['primary']:.4f} (was {h['prev_best']:.4f})")
     if status == 'rejected':
         cat = f" [{h['lever_category']}]" if h.get('lever_category') else ''
@@ -722,7 +729,8 @@ def _format_history_compact(h):
     if status in ('accepted', 'rejected'):
         raced = f" (raced {len(h['variants'])})" if h.get('variants') else ''
         session_note = ' (via code session)' if h.get('authored_via') == 'code_session' else ''
-        return (f"iter {h['iter']}: {status}{cat}{raced}{session_note} "
+        sig_note = '' if (status != 'accepted' or h.get('significant')) else ' (insignificant)'
+        return (f"iter {h['iter']}: {status}{sig_note}{cat}{raced}{session_note} "
                 f"\"{_trunc(h.get('hypothesis'))}\" -> {h['primary']:.4f}")
     if status == 'answered':
         return f"iter {h['iter']}: probe -> \"{_trunc(h.get('question'))}\""
@@ -839,7 +847,8 @@ def _format_reflection_block(history):
     if last['status'] == 'failed':
         lines.append(f"Result: FAILED after retries -- {last.get('error_summary')}")
         return "\n".join(lines)
-    lines.append(f"Result: {last['status']} -- valid primary {last['primary']:.4f} "
+    sig_note = '' if (last['status'] != 'accepted' or last.get('significant')) else ' (insignificant, below epsilon)'
+    lines.append(f"Result: {last['status']}{sig_note} -- valid primary {last['primary']:.4f} "
                  f"(was {last['prev_best']:.4f})")
     v = last.get('metrics', {}).get('valid', {})
     pv = last.get('prev_metrics', {}).get('valid', {})
@@ -856,10 +865,12 @@ def _format_reflection_block(history):
 def top_candidates(history, top_k=5):
     """Every attempted node with a real trained-model score (accepted or rejected --
     excludes research/probe/failed turns, which have no score), ranked descending by
-    valid primary. Surfaces ensembling material: several rejected nodes can individually
-    score close to or even above the current accepted best without any one clearing
-    ACCEPT_EPS on its own -- averaging two independent ones can reduce variance enough
-    to cross that bar even when neither does alone."""
+    valid primary. Every node here that beat the best-at-the-time was accepted (any
+    positive gain replaces best_dir, see orchestrator.py), so 'rejected' now strictly
+    means it scored at or below whatever was best when it ran -- still useful
+    ensembling material for a genuinely different mechanism sitting outside the
+    current chain, just not a "secretly better than best" candidate the way it could
+    be before accept/reject and significance (ACCEPT_EPS) were decoupled."""
     candidates = [h for h in history if h.get('status') in ('accepted', 'rejected')
                   and h.get('primary') is not None]
     return sorted(candidates, key=lambda h: -h['primary'])[:top_k]
@@ -870,7 +881,8 @@ def _format_top_candidates(history, top_k=5):
     if not top:
         return "(no scored candidates yet)"
     return "\n".join(
-        f"- iter {h['iter']} [{h.get('lever_category') or 'uncategorized'}] {h['status']}: "
+        f"- iter {h['iter']} [{h.get('lever_category') or 'uncategorized'}] "
+        f"{h['status']}{'' if (h['status'] != 'accepted' or h.get('significant')) else ' (insignificant)'}: "
         f"valid primary {h['primary']:.4f} -- \"{_trunc(h.get('hypothesis'), 90)}\""
         for h in top)
 
@@ -881,25 +893,34 @@ def _format_ensemble_nudge(history, best_primary, min_count=2):
     the untried-category requirement) needed a "you've been stuck for a while" story to
     justify itself, which meant node 17 of a fresh invocation (streak resets to 0 on
     resume) would see zero pressure toward ensembling even though the evidence for it
-    -- 2+ candidates already individually beating the current best -- doesn't need a
-    streak to build up; it's already concretely true right now. Historically (see
-    agent_notes discussion), this model has only ever adopted an unusual mode when a
-    nudge was forceful and required, never from a passive "you could also try X"
-    suggestion -- so this mirrors that same forceful phrasing, just triggered by a
-    different, streak-independent condition. Excludes past 'ensembling' attempts from
-    the candidate pool -- a prior ensemble is itself already a combination, not a fresh
-    single mechanism worth suggesting as a NEW pairing partner, and counting its
-    category toward "these span different categories" would be misleading (ensembling
-    two single-mechanism candidates isn't diversity in the sense that actually helps).
-    Returns '' if fewer than `min_count` genuine single-mechanism candidates individually
-    beat best_primary."""
-    beaters = [h for h in top_candidates(history, top_k=10)
-               if h['primary'] > best_primary and h.get('lever_category') != 'ensembling']
-    if len(beaters) < min_count:
+    doesn't need a streak to build up; it's already concretely true right now.
+    Historically (see agent_notes discussion), this model has only ever adopted an
+    unusual mode when a nudge was forceful and required, never from a passive "you
+    could also try X" suggestion -- so this mirrors that same forceful phrasing, just
+    triggered by a different, streak-independent condition. Excludes past 'ensembling'
+    attempts from the candidate pool -- a prior ensemble is itself already a
+    combination, not a fresh single mechanism worth suggesting as a NEW pairing
+    partner, and counting its category toward "these span different categories" would
+    be misleading (ensembling two single-mechanism candidates isn't diversity in the
+    sense that actually helps).
+
+    Trigger condition (reworked when accept/reject and significance were decoupled --
+    see orchestrator.py's module docstring): used to fire on *rejected* nodes that
+    individually scored above the current best without clearing ACCEPT_EPS -- that
+    population is now empty by construction, since any node that beats best gets
+    accepted immediately. The equivalent signal now is nodes that WERE accepted but
+    only by an insignificant (<=ACCEPT_EPS) margin: each one moved the chain forward a
+    little on its own, individually too small to be a strong result, which is exactly
+    the situation where combining two decorrelated small-gain mechanisms is worth
+    trying. Returns '' if fewer than `min_count` such candidates exist."""
+    insignificant_accepts = [h for h in top_candidates(history, top_k=10)
+               if h.get('status') == 'accepted' and not h.get('significant')
+               and h.get('lever_category') != 'ensembling']
+    if len(insignificant_accepts) < min_count:
         return ""
     names = ", ".join(f"iter {h['iter']} ({h['primary']:.4f}, {h.get('lever_category') or 'uncategorized'})"
-                       for h in beaters)
-    distinct_cats = {h.get('lever_category') for h in beaters if h.get('lever_category')}
+                       for h in insignificant_accepts)
+    distinct_cats = {h.get('lever_category') for h in insignificant_accepts if h.get('lever_category')}
     if len(distinct_cats) < 2:
         diversity_note = (
             " Note: these all share the same lever_category, which is the specific failure mode node 17 "
@@ -911,12 +932,12 @@ def _format_ensemble_nudge(history, best_primary, min_count=2):
             "combining these two.")
     else:
         diversity_note = " These span different lever_categories, which is what actually makes ensembling likely to help."
-    return (f"\n★ {len(beaters)} past candidates already individually score ABOVE your current best "
-            f"({best_primary:.4f}) without any one of them being accepted on its own (their gain over "
-            f"whatever was best at the time fell short of the acceptance margin): {names}.{diversity_note} "
+    return (f"\n★ {len(insignificant_accepts)} past candidates were each accepted but only by an INSIGNIFICANT margin "
+            f"(current best {best_primary:.4f}, each individually cleared best-at-the-time by "
+            f"<= epsilon): {names}.{diversity_note} "
             f"This turn, strongly prefer ENSEMBLING two candidates with DIFFERENT lever categories "
             f"(LEVER_CATEGORY: ensembling) over proposing something brand new -- averaging genuinely "
-            f"decorrelated models' predictions can reduce enough variance to cross the acceptance margin "
+            f"decorrelated models' predictions can reduce enough variance to clear the significance margin "
             f"even when neither does alone, and at least one candidate's full code is given to you below, "
             f"verbatim, specifically so you can reuse it rather than re-deriving it from memory. Only "
             f"propose something else if you have a specific reason ensembling wouldn't work here, stated "

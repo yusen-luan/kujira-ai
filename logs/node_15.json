@@ -1,0 +1,101 @@
+{
+  "iter": 15,
+  "status": "rejected",
+  "significant": false,
+  "hypothesis": "hyperparameter_capacity is the one lever category never actually tried on the accepted-best plain bilinear BPR-FM: `k` (embedding/interaction dimension) is hardcoded at 16 and was never itself swept (only L2, dropout-on-a-different-architecture, aux-loss-weight, ensemble-weight, and rare-id-collapse-threshold have been swept so far). While I'm at it, I'm fixing a latent robustness bug in `run_model`: it currently does `run_fm(splits, seed=seed, verbose=verbose, **hparams)`, which would raise `TypeError` if the harness's generic hparams dict ever contains a key `run_fm` doesn't accept \u2014 I'm switching to explicit `hparams.get(name, default)` reads per the harness contract, with no change to the underlying FM/BPR mechanism itself.",
+  "reflection": "The requested EDA round mostly resurfaced fields (author-level aggregates, user_active_degree, tag, upload_type) whose mechanism (naive field-widening) was already directly falsified twice by the project's own ablation under both loss functions \u2014 retrying them without a different encoding/architecture wouldn't be a genuinely new test. Meanwhile the noise-floor probe (node 13) shows primary's bootstrap std (~0.0017, 90% range ~0.0055) is comparable to or larger than nearly every accepted/rejected gap seen so far (0.6041 vs 0.6033-0.6037), which is the more likely explanation for the plateau than any single rejected mechanism being wrong.",
+  "expected_effect": "I expect GAUC to move more than nDCG@5, since embedding capacity affects the quality of pairwise bilinear interactions used across the full eligible-user comparison pool (what GAUC aggregates), whereas nDCG@5 is dominated by noise from the majority of valid users who have fewer than 5 rows.",
+  "lever_category": "hyperparameter_capacity",
+  "changed_files": [
+    "baseline.py"
+  ],
+  "sweep": {
+    "param": "k",
+    "trials": [
+      {
+        "value": 8,
+        "ok": true,
+        "primary": 0.6038834452629089,
+        "error": null
+      },
+      {
+        "value": 24,
+        "ok": true,
+        "primary": 0.6032072305679321,
+        "error": null
+      },
+      {
+        "value": 40,
+        "ok": true,
+        "primary": 0.6034047603607178,
+        "error": null
+      },
+      {
+        "value": 64,
+        "ok": true,
+        "primary": 0.6030824184417725,
+        "error": null
+      }
+    ],
+    "best_value": 8
+  },
+  "metrics": {
+    "valid": {
+      "GAUC": 0.6707512140274048,
+      "nDCG@5": 0.5370156764984131,
+      "primary": 0.6038834452629089,
+      "users": 22377,
+      "rows": 124909
+    },
+    "test": {
+      "GAUC": 0.6638897657394409,
+      "nDCG@5": 0.5296291708946228,
+      "primary": 0.5967594385147095,
+      "users": 23875,
+      "rows": 170588
+    }
+  },
+  "prev_metrics": {
+    "valid": {
+      "GAUC": 0.6706587076187134,
+      "nDCG@5": 0.5374457240104675,
+      "primary": 0.6040521860122681,
+      "users": 22377,
+      "rows": 124909
+    },
+    "test": {
+      "GAUC": 0.6637696623802185,
+      "nDCG@5": 0.5308558344841003,
+      "primary": 0.5973127484321594,
+      "users": 23875,
+      "rows": 170588
+    }
+  },
+  "training_curve": {
+    "n_epochs_logged": 18,
+    "first_epoch_primary": 0.5926,
+    "best_epoch": 14,
+    "best_epoch_primary": 0.6039,
+    "last_epoch": 18,
+    "last_epoch_primary": 0.6016,
+    "early_stopped": true,
+    "degraded_after_best": true,
+    "still_improving_at_cutoff": false
+  },
+  "prev_best_primary": 0.6040521860122681,
+  "new_primary": 0.6038834452629089,
+  "llm_calls": [
+    {
+      "cost_usd": 0.2410746,
+      "ok": true,
+      "error": null
+    }
+  ],
+  "run_attempts": [
+    {
+      "attempt": 0,
+      "ok": true,
+      "error": null
+    }
+  ]
+}

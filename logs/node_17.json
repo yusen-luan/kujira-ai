@@ -1,0 +1,95 @@
+{
+  "iter": 17,
+  "status": "accepted",
+  "significant": false,
+  "hypothesis": "Rather than proposing yet another feature/architecture guess to chase noise-sized deltas, directly attack the noise itself: train the current-best bilinear BPR-FM mechanism as a small bag of independently-seeded models (different init + different per-epoch negative draws) and average their raw logits before evaluation. This is classic bagging variance-reduction, distinct from the \"ensembling\" lever's past failures (which combined two *architecturally different but highly correlated* single runs) \u2014 here the diversity source is training stochasticity in the exact same accepted-best mechanism, which should genuinely decorrelate the ranking errors that dominate the noise floor identified in probe node 13.",
+  "reflection": "The pos_bucket fatigue feature actually made things slightly worse and overfit (peaked epoch 4, degraded by epoch 8) \u2014 the metric-noise probe (node 13, primary bootstrap std ~0.0017, p5-p95 range ~0.0055) suggests this loss, like several previous \"rejections,\" may partly reflect training-run noise rather than a genuinely worse mechanism. Nine iterations of single-seed point-estimates chasing sub-0.005 deltas is consistent with us fighting noise, not signal.",
+  "expected_effect": "nDCG@5 should move more than GAUC, because probe node 13 found nDCG@5's bootstrap std (0.00264) exceeds GAUC's (0.00229) and 55% of valid users have <5 rows where per-model score noise most easily flips a top-5 ordering \u2014 averaging independently-trained models should smooth exactly this small-candidate-set instability the most.",
+  "lever_category": "training_procedure",
+  "changed_files": [
+    "baseline.py"
+  ],
+  "sweep": {
+    "param": "n_bag",
+    "trials": [
+      {
+        "value": 1,
+        "ok": true,
+        "primary": 0.6028287410736084,
+        "error": null
+      },
+      {
+        "value": 3,
+        "ok": true,
+        "primary": 0.6041423082351685,
+        "error": null
+      },
+      {
+        "value": 5,
+        "ok": true,
+        "primary": 0.603809118270874,
+        "error": null
+      }
+    ],
+    "best_value": 3
+  },
+  "metrics": {
+    "valid": {
+      "GAUC": 0.6708433032035828,
+      "nDCG@5": 0.5374413728713989,
+      "primary": 0.6041423082351685,
+      "users": 22377,
+      "rows": 124909
+    },
+    "test": {
+      "GAUC": 0.6649225950241089,
+      "nDCG@5": 0.5310333967208862,
+      "primary": 0.5979779958724976,
+      "users": 23875,
+      "rows": 170588
+    }
+  },
+  "prev_metrics": {
+    "valid": {
+      "GAUC": 0.6706587076187134,
+      "nDCG@5": 0.5374457240104675,
+      "primary": 0.6040521860122681,
+      "users": 22377,
+      "rows": 124909
+    },
+    "test": {
+      "GAUC": 0.6637696623802185,
+      "nDCG@5": 0.5308558344841003,
+      "primary": 0.5973127484321594,
+      "users": 23875,
+      "rows": 170588
+    }
+  },
+  "training_curve": {
+    "n_epochs_logged": 29,
+    "first_epoch_primary": 0.5938,
+    "best_epoch": 6,
+    "best_epoch_primary": 0.6033,
+    "last_epoch": 11,
+    "last_epoch_primary": 0.6017,
+    "early_stopped": true,
+    "degraded_after_best": true,
+    "still_improving_at_cutoff": false
+  },
+  "prev_best_primary": 0.6040521860122681,
+  "new_primary": 0.6041423082351685,
+  "llm_calls": [
+    {
+      "cost_usd": 0.2370466,
+      "ok": true,
+      "error": null
+    }
+  ],
+  "run_attempts": [
+    {
+      "attempt": 0,
+      "ok": true,
+      "error": null
+    }
+  ]
+}

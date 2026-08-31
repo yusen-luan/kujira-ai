@@ -1,0 +1,47 @@
+{
+  "iter": 14,
+  "status": "eda_round",
+  "eda_round_question": "Given that per-candidate valid-split deltas are largely within the metric's own sampling noise, the more promising path is probably a genuinely new signal source (not another small reweighting/regularization/capacity tweak to the same 5-field FM) \u2014 but I don't know what's actually available in the raw data beyond what's already been tried (user/video side fields, historical rates, tab, duration). I'd like a fresh exploratory EDA pass to look for anything with a plausibly LARGE effect size (e.g. strong temporal/session structure, video content/category signal, or user-activity-level segmentation where the FM might be systematically failing) that could produce a gap big enough to clear the ~0.005-0.006 noise floor, rather than continuing to guess at marginal single-digit-per-mille tweaks.",
+  "reflection": "The probe confirmed the plateau's root cause: the valid-split primary metric has a bootstrap p5-p95 range of ~0.0055 and std of ~0.0017 under a completely fixed scoring function, which is comparable to or larger than nearly every gap (0.002-0.007) that has separated accepted from rejected candidates over the last 7 iterations. This means most of those \"rejections\" may simply be noise, not evidence the mechanisms don't work \u2014 so continuing to propose small variants of the same FM-capacity/regularization/reweighting mechanisms and reading their single-run valid deltas as ground truth is no longer a reliable strategy.",
+  "eda_round": 0,
+  "stopped_reason": "turn_limit",
+  "llm_calls": [
+    {
+      "cost_usd": 0.1363566,
+      "ok": true,
+      "error": null
+    },
+    {
+      "cost_usd": 0.058957999999999997,
+      "ok": true,
+      "error": null
+    },
+    {
+      "cost_usd": 0.0755824,
+      "ok": true,
+      "error": null
+    },
+    {
+      "cost_usd": 0.04741440000000001,
+      "ok": true,
+      "error": null
+    }
+  ],
+  "run_attempts": [
+    {
+      "attempt": 0,
+      "ok": true,
+      "error": null
+    },
+    {
+      "attempt": 0,
+      "ok": true,
+      "error": null
+    },
+    {
+      "attempt": 0,
+      "ok": true,
+      "error": null
+    }
+  ]
+}

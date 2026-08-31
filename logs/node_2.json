@@ -1,85 +1,86 @@
 {
   "iter": 2,
   "status": "accepted",
-  "hypothesis": "Replace the plain FM with a lightweight DeepFM-style model implemented in plain numpy (FM linear+2-way term plus a small MLP head over concatenated field embeddings, both trained jointly via manual backprop/Adam) \u2014 the pure FM can only capture pairwise interactions, while a shallow MLP can capture higher-order combinations (e.g. tab \u00d7 dur_bucket \u00d7 author_id) that plain FM structurally can't represent, which the reference DeepFM literature (dfm.py in the model zoo) suggests helps CTR-style ranking tasks like this one.",
+  "significant": true,
+  "hypothesis": "The FM is currently trained with pointwise BCE on individual (user,video) rows, but both evaluation metrics (GAUC, nDCG@5) are computed within-user, pairwise/ranking-based \u2014 a mismatch between training objective and eval objective. Switching to a pairwise BPR-style loss (Rendle et al. 2009), where for each positive (long_view=1) row we sample a negative (long_view=0) row from the *same user's* other impressions and train the model to score the positive above the negative, directly optimizes intra-user ranking correctness instead of absolute calibration. This is a training-procedure/negative-sampling change only (same FM architecture, same FIELDS), so it should isolate whether loss-objective mismatch \u2014 not model capacity or features \u2014 is the current bottleneck, especially given last iteration's overfitting signature suggests we should be looking at how the model is trained/regularized rather than adding more capacity/features right now.",
   "reflection": "",
-  "expected_effect": "nDCG@5 should improve more than GAUC, since the MLP's higher-order interaction modeling primarily helps fine-grained relative ordering of top candidates within a user's session rather than overall per-user ranking calibration.",
-  "lever_category": "model_architecture",
+  "expected_effect": "GAUC should move more than nDCG@5, since BPR's pairwise loss directly optimizes the same intra-user pairwise ordering that GAUC measures, whereas nDCG@5 additionally weights position-within-top-5 which BPR treats all pairs identically regardless of rank position.",
+  "lever_category": "negative_sampling",
   "changed_files": [
     "baseline.py"
   ],
   "sweep": {
-    "param": "mlp_hidden",
+    "param": "neg_per_pos",
     "trials": [
       {
-        "value": 16,
+        "value": 1,
         "ok": true,
-        "primary": 0.6044663289576793,
+        "primary": 0.6028287410736084,
         "error": null
       },
       {
-        "value": 32,
+        "value": 2,
         "ok": true,
-        "primary": 0.604163073263061,
+        "primary": 0.6040521860122681,
         "error": null
       },
       {
-        "value": 64,
+        "value": 4,
         "ok": true,
-        "primary": 0.6038256869165579,
+        "primary": 0.6026297807693481,
         "error": null
       }
     ],
-    "best_value": 16
+    "best_value": 2
   },
   "metrics": {
     "valid": {
-      "GAUC": 0.671286196795183,
-      "nDCG@5": 0.5376464611201756,
-      "primary": 0.6044663289576793,
+      "GAUC": 0.6706587076187134,
+      "nDCG@5": 0.5374457240104675,
+      "primary": 0.6040521860122681,
       "users": 22377,
       "rows": 124909
     },
     "test": {
-      "GAUC": 0.6643867142265109,
-      "nDCG@5": 0.5299183861567823,
-      "primary": 0.5971525501916466,
+      "GAUC": 0.6637696623802185,
+      "nDCG@5": 0.5308558344841003,
+      "primary": 0.5973127484321594,
       "users": 23875,
       "rows": 170588
     }
   },
   "prev_metrics": {
     "valid": {
-      "GAUC": 0.6671326321610643,
-      "nDCG@5": 0.5358048805448711,
-      "primary": 0.6014687563529677,
+      "GAUC": 0.6671333909034729,
+      "nDCG@5": 0.5358057022094727,
+      "primary": 0.6014695167541504,
       "users": 22377,
       "rows": 124909
     },
     "test": {
-      "GAUC": 0.6621228758829982,
-      "nDCG@5": 0.5285584577777603,
-      "primary": 0.5953406668303793,
+      "GAUC": 0.6621216535568237,
+      "nDCG@5": 0.5285593271255493,
+      "primary": 0.5953404903411865,
       "users": 23875,
       "rows": 170588
     }
   },
   "training_curve": {
-    "n_epochs_logged": 12,
-    "first_epoch_primary": 0.5972,
-    "best_epoch": 8,
-    "best_epoch_primary": 0.6045,
-    "last_epoch": 12,
-    "last_epoch_primary": 0.5992,
+    "n_epochs_logged": 7,
+    "first_epoch_primary": 0.5986,
+    "best_epoch": 3,
+    "best_epoch_primary": 0.6041,
+    "last_epoch": 7,
+    "last_epoch_primary": 0.6,
     "early_stopped": true,
     "degraded_after_best": true,
     "still_improving_at_cutoff": false
   },
-  "prev_best_primary": 0.6014687563529677,
-  "new_primary": 0.6044663289576793,
+  "prev_best_primary": 0.6014695167541504,
+  "new_primary": 0.6040521860122681,
   "llm_calls": [
     {
-      "cost_usd": 0.227707,
+      "cost_usd": 0.21430559999999998,
       "ok": true,
       "error": null
     }

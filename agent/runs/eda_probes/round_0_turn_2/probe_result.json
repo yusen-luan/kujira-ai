@@ -1,0 +1,58 @@
+{
+  "bin_0": {
+    "n": 112509,
+    "mean_duration_ms": 6988.213396261633,
+    "long_view_rate": 0.27936431752126495
+  },
+  "bin_1": {
+    "n": 115695,
+    "mean_duration_ms": 15602.445049483556,
+    "long_view_rate": 0.2750680669000389
+  },
+  "bin_2": {
+    "n": 113602,
+    "mean_duration_ms": 25522.652805408354,
+    "long_view_rate": 0.3459182056653932
+  },
+  "bin_3": {
+    "n": 114168,
+    "mean_duration_ms": 39997.92204470605,
+    "long_view_rate": 0.366775278536893
+  },
+  "bin_4": {
+    "n": 114486,
+    "mean_duration_ms": 60853.55298464441,
+    "long_view_rate": 0.3641842670719564
+  },
+  "bin_5": {
+    "n": 114174,
+    "mean_duration_ms": 81020.29123968679,
+    "long_view_rate": 0.35939881233906146
+  },
+  "bin_6": {
+    "n": 114092,
+    "mean_duration_ms": 103798.88281386951,
+    "long_view_rate": 0.37604740034358236
+  },
+  "bin_7": {
+    "n": 111651,
+    "mean_duration_ms": 137588.17514397542,
+    "long_view_rate": 0.34786074464178557
+  },
+  "bin_8": {
+    "n": 116551,
+    "mean_duration_ms": 192325.75712778096,
+    "long_view_rate": 0.33677960721057737
+  },
+  "bin_9": {
+    "n": 114184,
+    "mean_duration_ms": 313503.8592534856,
+    "long_view_rate": 0.3150353814895257
+  },
+  "overall_rate": 0.33661989357749283,
+  "rate_min": 0.2750680669000389,
+  "rate_max": 0.37604740034358236,
+  "rate_spread": 0.10097933344354348,
+  "pearson_corr_duration_vs_longview": 0.0034659365282692822,
+  "sign_changes_across_bins": 4
+}

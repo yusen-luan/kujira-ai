@@ -1,0 +1,95 @@
+{
+  "iter": 11,
+  "status": "rejected",
+  "significant": false,
+  "hypothesis": "Per the plateau diagnosis (probe on node 10) and the ensembling guidance to pick structurally different mechanisms, combine the current-best plain bilinear BPR-FM (negative_sampling lever, 0.6041) with a BPR-trained DeepFM (adds an MLP over the same field embeddings \u2014 model_architecture lever, scored 0.6037 standalone in iter 7) in one run_model() call: train both on the same BPR pairwise objective, z-score-standardize each model's valid-split scores, and average. Since the two score functions differ in mechanism (pure bilinear interactions vs. bilinear+non-linear-MLP), their errors should be less correlated than the same-architecture ensembles already tried (e.g. iter 17's near-identical-FM ensemble), so averaging should reduce variance across the small informative-user pool enough to edge past the ceiling both hit individually.",
+  "reflection": "The probe confirms the primary metric is genuinely bottlenecked by a small pool of \"informative\" users (only ~58-64% of valid/test users are label-mixed, median 4-5 rows/user), which explains why six structurally different mechanisms landed within 0.002-0.007 of each other \u2014 there's a hard ceiling on how much any single model can move the metric given how little rankable signal most users provide. That's a fundamental noise-floor issue, not something a 7th single-mechanism tweak will fix; the highest-leverage remaining move is variance reduction via ensembling two genuinely different mechanisms already validated separately.",
+  "expected_effect": "GAUC should move more than nDCG@5, since GAUC aggregates over many more mixed-label users/pairs (variance reduction from averaging two structurally different scorers helps a broad, noisy ranking signal) while nDCG@5 is already near-saturated for the majority of users with <5 valid rows and can't move much regardless.",
+  "lever_category": "ensembling",
+  "changed_files": [
+    "baseline.py"
+  ],
+  "sweep": {
+    "param": "ens_weight",
+    "trials": [
+      {
+        "value": 0.3,
+        "ok": true,
+        "primary": 0.6033334136009216,
+        "error": null
+      },
+      {
+        "value": 0.5,
+        "ok": true,
+        "primary": 0.6031932830810547,
+        "error": null
+      },
+      {
+        "value": 0.7,
+        "ok": true,
+        "primary": 0.6032490730285645,
+        "error": null
+      }
+    ],
+    "best_value": 0.3
+  },
+  "metrics": {
+    "valid": {
+      "GAUC": 0.6697003841400146,
+      "nDCG@5": 0.5369664430618286,
+      "primary": 0.6033334136009216,
+      "users": 22377,
+      "rows": 124909
+    },
+    "test": {
+      "GAUC": 0.6648441553115845,
+      "nDCG@5": 0.5311005115509033,
+      "primary": 0.5979723334312439,
+      "users": 23875,
+      "rows": 170588
+    }
+  },
+  "prev_metrics": {
+    "valid": {
+      "GAUC": 0.6706587076187134,
+      "nDCG@5": 0.5374457240104675,
+      "primary": 0.6040521860122681,
+      "users": 22377,
+      "rows": 124909
+    },
+    "test": {
+      "GAUC": 0.6637696623802185,
+      "nDCG@5": 0.5308558344841003,
+      "primary": 0.5973127484321594,
+      "users": 23875,
+      "rows": 170588
+    }
+  },
+  "training_curve": {
+    "n_epochs_logged": 15,
+    "first_epoch_primary": 0.5938,
+    "best_epoch": 4,
+    "best_epoch_primary": 0.6034,
+    "last_epoch": 7,
+    "last_epoch_primary": 0.6003,
+    "early_stopped": true,
+    "degraded_after_best": true,
+    "still_improving_at_cutoff": false
+  },
+  "prev_best_primary": 0.6040521860122681,
+  "new_primary": 0.6033334136009216,
+  "llm_calls": [
+    {
+      "cost_usd": 0.2970036,
+      "ok": true,
+      "error": null
+    }
+  ],
+  "run_attempts": [
+    {
+      "attempt": 0,
+      "ok": true,
+      "error": null
+    }
+  ]
+}

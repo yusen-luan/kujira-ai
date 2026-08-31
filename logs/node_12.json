@@ -1,0 +1,96 @@
+{
+  "iter": 12,
+  "status": "rejected",
+  "significant": false,
+  "hypothesis": "Every past variant (feature widening, L2 sweep, deeper architectures, multi-task, popularity reweighting, ensembling) has shown the same early-peak-then-degrade overfitting signature under a fixed bilinear-interaction capacity \u2014 none has touched the actual *encoding* of the highest-cardinality fields (user_id, video_id, author_id), which likely have a long tail of very-low-frequency ids whose embeddings get memorized/noisy rather than learned. I'll add a frequency-threshold fallback in data.py's encode(): any user_id/video_id/author_id value appearing fewer than `min_count` times in train gets collapsed into one shared \"RARE\" bucket per field (distinct from the existing cold-start UNK bucket for values never seen in train at all), reducing effective embedding-table capacity exactly where it's noisiest while leaving frequent-id embeddings untouched.",
+  "reflection": "The DeepFM+FM ensemble underperformed both standalone models (0.6033 vs 0.6041) and its own training curve degraded after epoch 4 \u2014 consistent with the overfitting signature every mechanism so far has shown; averaging two overfit-prone scorers didn't fix the underlying capacity/regularization issue. Per the plateau warning, I should try an untried lever rather than another variant of ensembling/architecture/training-loss changes.",
+  "expected_effect": "GAUC should move more than nDCG@5, since denoising the tail of the user_id/video_id/author_id embedding tables should generalize better across the broad population of users/rows that GAUC aggregates over, while nDCG@5 is already near-saturated for the majority of users with <5 valid rows (per the node-10 probe) regardless of embedding quality.",
+  "lever_category": "data_quality_preprocessing",
+  "changed_files": [
+    "data.py",
+    "baseline.py"
+  ],
+  "sweep": {
+    "param": "min_count",
+    "trials": [
+      {
+        "value": 2,
+        "ok": true,
+        "primary": 0.6028556823730469,
+        "error": null
+      },
+      {
+        "value": 5,
+        "ok": true,
+        "primary": 0.6032660007476807,
+        "error": null
+      },
+      {
+        "value": 10,
+        "ok": true,
+        "primary": 0.6026096343994141,
+        "error": null
+      }
+    ],
+    "best_value": 5
+  },
+  "metrics": {
+    "valid": {
+      "GAUC": 0.6699736714363098,
+      "nDCG@5": 0.5365582704544067,
+      "primary": 0.6032660007476807,
+      "users": 22377,
+      "rows": 124909
+    },
+    "test": {
+      "GAUC": 0.6651764512062073,
+      "nDCG@5": 0.530894935131073,
+      "primary": 0.5980356931686401,
+      "users": 23875,
+      "rows": 170588
+    }
+  },
+  "prev_metrics": {
+    "valid": {
+      "GAUC": 0.6706587076187134,
+      "nDCG@5": 0.5374457240104675,
+      "primary": 0.6040521860122681,
+      "users": 22377,
+      "rows": 124909
+    },
+    "test": {
+      "GAUC": 0.6637696623802185,
+      "nDCG@5": 0.5308558344841003,
+      "primary": 0.5973127484321594,
+      "users": 23875,
+      "rows": 170588
+    }
+  },
+  "training_curve": {
+    "n_epochs_logged": 11,
+    "first_epoch_primary": 0.5961,
+    "best_epoch": 7,
+    "best_epoch_primary": 0.6033,
+    "last_epoch": 11,
+    "last_epoch_primary": 0.6024,
+    "early_stopped": true,
+    "degraded_after_best": true,
+    "still_improving_at_cutoff": false
+  },
+  "prev_best_primary": 0.6040521860122681,
+  "new_primary": 0.6032660007476807,
+  "llm_calls": [
+    {
+      "cost_usd": 0.21783160000000001,
+      "ok": true,
+      "error": null
+    }
+  ],
+  "run_attempts": [
+    {
+      "attempt": 0,
+      "ok": true,
+      "error": null
+    }
+  ]
+}

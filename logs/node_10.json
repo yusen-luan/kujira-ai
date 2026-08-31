@@ -1,0 +1,52 @@
+{
+  "iter": 10,
+  "status": "answered",
+  "question": "In the valid (and train) split, what fraction of users have BOTH a long_view=1 and a long_view=0 row (i.e. can contribute a non-trivial ranking comparison to GAUC), what fraction of users have all-same-label rows (contributing no ranking signal), what's the median/mean number of rows per user, and what fraction of users have fewer than 5 valid rows (meaning nDCG@5 is trivially saturated/underdetermined for them)? This tells us whether the primary metric's sensitivity is bottlenecked by a small pool of \"informative\" users, which would explain why structurally different mechanisms keep landing within ~0.002-0.007 of each other.",
+  "reflection": "My last iteration spent the web-research budget confirming Dynamic Negative Sampling (DNS) is a plausible lever, but didn't test any code, so it didn't move the plateau. Given 5 of the last 6 code-level changes (across negative_sampling, training_procedure, model_architecture, multi_task, popularity_debiasing) all landed within ~0.001-0.007 of the same 0.604 ceiling regardless of mechanism, I suspect the metric itself has a small \"effective\" sample of users that actually drives GAUC/nDCG@5 \u2014 i.e. most of these deltas may be within noise of the evaluation set's own limited discriminative power, not real signal differences between mechanisms.",
+  "result": {
+    "train_n_users": 26210,
+    "train_n_rows": 1141112,
+    "train_mean_rows_per_user": 43.53727584891263,
+    "train_median_rows_per_user": 31.0,
+    "train_frac_users_mixed_label": 0.9267455169782526,
+    "train_frac_rows_from_mixed_users": 0.9904724514333387,
+    "train_frac_users_all_positive": 0.02254864555513163,
+    "train_frac_users_all_negative": 0.0507058374666158,
+    "train_frac_users_lt5_rows": 0.08618847768027471,
+    "train_pos_rate": 0.33661989357749283,
+    "valid_n_users": 22377,
+    "valid_n_rows": 124909,
+    "valid_mean_rows_per_user": 5.582026187603343,
+    "valid_median_rows_per_user": 4.0,
+    "valid_frac_users_mixed_label": 0.5777807570273048,
+    "valid_frac_rows_from_mixed_users": 0.7890704432827098,
+    "valid_frac_users_all_positive": 0.11900612235777808,
+    "valid_frac_users_all_negative": 0.3032131206149171,
+    "valid_frac_users_lt5_rows": 0.5543191670018323,
+    "valid_pos_rate": 0.313284070803545,
+    "test_n_users": 23875,
+    "test_n_rows": 170588,
+    "test_mean_rows_per_user": 7.145047120418848,
+    "test_median_rows_per_user": 5.0,
+    "test_frac_users_mixed_label": 0.6366910994764398,
+    "test_frac_rows_from_mixed_users": 0.8412549534551083,
+    "test_frac_users_all_positive": 0.0922303664921466,
+    "test_frac_users_all_negative": 0.27107853403141363,
+    "test_frac_users_lt5_rows": 0.46265968586387435,
+    "test_pos_rate": 0.31345112200154757
+  },
+  "llm_calls": [
+    {
+      "cost_usd": 0.1371966,
+      "ok": true,
+      "error": null
+    }
+  ],
+  "run_attempts": [
+    {
+      "attempt": 0,
+      "ok": true,
+      "error": null
+    }
+  ]
+}

@@ -23,12 +23,17 @@ Per-iteration flow:
        --escalate_after — replaces v1's separate diagnosis-classification
        call with a cheaper in-prompt nudge.
     3. The official convergence rule (epsilon=--converge_eps, N=--converge_n
-       consecutive nodes with no improvement) stops the run early, same as v1.
-       A single epsilon (--converge_eps) drives both accept/reject and the
-       plateau streak, so the two can't disagree: a node is accepted iff its
-       gain over the current best exceeds converge_eps, and that's exactly
-       the condition that resets the streak from step 2 to 0 -- any accepted
-       node resets it, any rejected node increments it.
+       consecutive nodes with no *significant* improvement) stops the run
+       early, same as v1. Accept/reject and significance are deliberately
+       decoupled (organizer FAQ: epsilon/N are ours to define as long as
+       we're consistent within a run): a node is accepted -- i.e. replaces
+       best_dir -- iff its primary beats the current best at all, by any
+       margin, so best_dir always holds the actual best-ever score rather
+       than silently discarding a real (if small) improvement. Separately,
+       that gain is marked 'significant' iff it exceeds converge_eps; only
+       significance drives the plateau streak from step 2 -- a significant
+       accept resets it to 0, anything else (an insignificant accept, or an
+       outright reject) increments it.
 
 Usage:
     python orchestrator.py                       # reproduce baseline, then 4 LLM iterations
@@ -371,13 +376,19 @@ def load_prior_history():
         status = record.get('status')
         entry = {'iter': record.get('iter', node_num), 'status': status}
         if status in ('accepted', 'rejected'):
+            # 'significant' postdates the accept/reject-vs-significance split (see orchestrator.py's
+            # module docstring) -- older node_N.json files predate the field entirely. Back-fill it as
+            # True for any 'accepted' entry from that era: the OLD accept rule required gain >
+            # converge_eps, so every old accept WAS significant by construction; only the field itself
+            # was never recorded. False is always correct for 'rejected' regardless of era.
             entry.update(hypothesis=record.get('hypothesis'), reflection=record.get('reflection'),
                          expected_effect=record.get('expected_effect'), lever_category=record.get('lever_category'),
                          metrics=record.get('metrics'),
                          prev_metrics=record.get('prev_metrics'), training_curve=record.get('training_curve'),
                          primary=record.get('new_primary'), prev_best=record.get('prev_best_primary'),
                          sweep=record.get('sweep'), variants=record.get('variants'),
-                         winning_variant=record.get('winning_variant'), authored_via=record.get('authored_via'))
+                         winning_variant=record.get('winning_variant'), authored_via=record.get('authored_via'),
+                         significant=record.get('significant', status == 'accepted'))
         elif status == 'answered':
             entry.update(question=record.get('question'), reflection=record.get('reflection'))
         elif status == 'failed':
@@ -767,14 +778,15 @@ def _finalize_hypothesis_node(node_id, iter_dir, hypothesis, expected_effect, le
                                          'hypothesis': hypothesis, 'error_summary': result['error'], **extra}
 
     new_primary = result['metrics']['valid']['primary']
-    if new_primary > best_primary + args.converge_eps:
+    significant = new_primary > best_primary + args.converge_eps
+    if new_primary > best_primary:
         for fname in pt.ALLOWED_FILES:
             shutil.copy2(iter_dir / fname, best_dir / fname)
         status, out_best, out_metrics = 'accepted', new_primary, result['metrics']
     else:
         status, out_best, out_metrics = 'rejected', best_primary, prev_metrics
 
-    record = {'iter': node_id, 'status': status, 'hypothesis': hypothesis,
+    record = {'iter': node_id, 'status': status, 'significant': significant, 'hypothesis': hypothesis,
               'reflection': reflection, 'expected_effect': expected_effect,
               'lever_category': lever_category, 'changed_files': changed,
               'sweep': sweep, 'metrics': result['metrics'], 'prev_metrics': prev_metrics,
@@ -782,7 +794,8 @@ def _finalize_hypothesis_node(node_id, iter_dir, hypothesis, expected_effect, le
               'prev_best_primary': best_primary, 'new_primary': new_primary,
               'llm_calls': llm_calls, 'run_attempts': run_attempts, **extra}
     write_log(node_id, record)
-    return status, out_best, out_metrics, {'iter': node_id, 'status': status, 'hypothesis': hypothesis,
+    return status, out_best, out_metrics, {'iter': node_id, 'status': status, 'significant': significant,
+                               'hypothesis': hypothesis,
                                'reflection': reflection, 'expected_effect': expected_effect,
                                'lever_category': lever_category, 'sweep': sweep,
                                'metrics': result['metrics'], 'prev_metrics': prev_metrics,
@@ -1083,14 +1096,16 @@ def run_iteration(node_id, best_dir, best_primary, prev_metrics, history, args, 
             sweep = {'param': win_sweep_param, 'trials': trials, 'best_value': best_value}
 
         new_primary = best_result['metrics']['valid']['primary']
-        if new_primary > best_primary + args.converge_eps:
+        significant = new_primary > best_primary + args.converge_eps
+        if new_primary > best_primary:
             for fname in pt.ALLOWED_FILES:
                 shutil.copy2(variant_dirs[best_i] / fname, best_dir / fname)
             status, out_best, out_metrics = 'accepted', new_primary, best_result['metrics']
         else:
             status, out_best, out_metrics = 'rejected', best_primary, prev_metrics
 
-        record = {'iter': node_id, 'status': status, 'hypothesis': winning_hypothesis,
+        record = {'iter': node_id, 'status': status, 'significant': significant,
+                   'hypothesis': winning_hypothesis,
                    'reflection': reflection, 'expected_effect': winning_expected_effect,
                    'lever_category': winning_lever_category,
                    'changed_files': list(variants[best_i]['files'].keys()), 'variants': variant_records,
@@ -1100,7 +1115,8 @@ def run_iteration(node_id, best_dir, best_primary, prev_metrics, history, args, 
                    'llm_calls': llm_calls, 'run_attempts': []}
         write_log(node_id, record)
         return (status, out_best, out_metrics,
-                {'iter': node_id, 'status': status, 'hypothesis': winning_hypothesis, 'reflection': reflection,
+                {'iter': node_id, 'status': status, 'significant': significant,
+                 'hypothesis': winning_hypothesis, 'reflection': reflection,
                  'expected_effect': winning_expected_effect, 'lever_category': winning_lever_category,
                  'sweep': sweep, 'metrics': best_result['metrics'],
                  'prev_metrics': prev_metrics, 'training_curve': best_result.get('training_curve'),
@@ -1206,8 +1222,12 @@ def main():
                           'pass (same as --eda_agent_turns 0) and the mid-run EDA_ROUND_REQUEST '
                           'option (same as --eda_round_budget 0)')
     ap.add_argument('--converge_eps', type=float, default=0.002,
-                     help='official convergence epsilon: stop early once no node improves the overall '
-                          'best primary by more than this over --converge_n consecutive nodes')
+                     help='significance threshold for the convergence rule: a node is always accepted '
+                          '(replaces best_dir) on any positive gain, but is only marked "significant" '
+                          '-- and only a significant accept resets the plateau streak below -- when its '
+                          'gain over the prior best exceeds this. Stop early once --converge_n '
+                          'consecutive nodes each land insignificant (an insignificant accept or an '
+                          'outright reject)')
     ap.add_argument('--converge_n', type=int, default=3,
                      help='official convergence N (see --converge_eps)')
     ap.add_argument('--early_stop', action=argparse.BooleanOptionalAction, default=True,
@@ -1305,7 +1325,8 @@ def main():
 
         if status in ('accepted', 'rejected'):
             display.result_line(entry['status'], entry.get('hypothesis'), entry.get('primary'),
-                                 entry.get('prev_best'), entry.get('error_summary'))
+                                 entry.get('prev_best'), entry.get('error_summary'),
+                                 significant=entry.get('significant'))
         elif status == 'answered':
             display.probe_line('answered', entry.get('question'))
         elif status in ('researched', 'research_failed', 'research_denied'):
@@ -1323,8 +1344,7 @@ def main():
         node_id += 1
 
         if status in ('accepted', 'rejected'):
-            gain = entry['primary'] - entry['prev_best']
-            plateau_streak = 0 if gain > args.converge_eps else plateau_streak + 1
+            plateau_streak = 0 if entry.get('significant') else plateau_streak + 1
             if plateau_streak >= args.converge_n:
                 if args.early_stop:
                     converged = True

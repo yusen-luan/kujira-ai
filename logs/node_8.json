@@ -1,0 +1,86 @@
+{
+  "iter": 8,
+  "status": "rejected",
+  "significant": false,
+  "hypothesis": "Per the ESMM literature note (Ma et al. 2018) already retrieved for this project, add `is_like` as an auxiliary pointwise-BCE training signal sharing the FM's embedding table `V` with the main long_view BPR task (separate small linear heads `W_main`/`W_aux` per task, main task still scored/evaluated alone). This gives the shared embeddings a second, denser (though still sparse) supervision source every epoch, which should act as a regularizer on `V` and reduce the overfitting pattern that has plagued every long_view-only FM variant tried so far, without adding raw score-function capacity (unlike the rejected DeepFM attempt).",
+  "reflection": "The DeepFM+dropout swap (iter 7) still overfit after its epoch-2 peak despite dropout regularization \u2014 more raw interaction capacity alone didn't fix the underlying signal-scarcity problem, since it's still trained on `long_view` alone. Given the plateau, I have a specific reason to skip the research question this turn: the literature already retrieved (ESMM, SIGIR 2018) directly names the exact untried mechanism worth trying \u2014 jointly modeling `long_view` with a denser auxiliary signal (`is_like`) via a shared embedding table \u2014 and I have a concrete, implementable plan for it without needing more external search.",
+  "expected_effect": "GAUC should move more than nDCG@5, since the auxiliary task densifies gradient signal across the whole training set (not just top-of-list discrimination), which should primarily improve global embedding calibration/generalization rather than fine top-5 ordering.",
+  "lever_category": "multi_task",
+  "changed_files": [
+    "data.py",
+    "baseline.py"
+  ],
+  "sweep": {
+    "param": "aux_weight",
+    "trials": [
+      {
+        "value": 0.1,
+        "ok": true,
+        "primary": 0.6037158370018005,
+        "error": null
+      },
+      {
+        "value": 0.3,
+        "ok": true,
+        "primary": 0.6004940271377563,
+        "error": null
+      },
+      {
+        "value": 0.6,
+        "ok": true,
+        "primary": 0.5994890332221985,
+        "error": null
+      }
+    ],
+    "best_value": 0.1
+  },
+  "metrics": {
+    "valid": {
+      "GAUC": 0.670197069644928,
+      "nDCG@5": 0.5372346043586731,
+      "primary": 0.6037158370018005,
+      "users": 22377,
+      "rows": 124909
+    },
+    "test": {
+      "GAUC": 0.664837658405304,
+      "nDCG@5": 0.5306676030158997,
+      "primary": 0.5977526307106018,
+      "users": 23875,
+      "rows": 170588
+    }
+  },
+  "prev_metrics": {
+    "valid": {
+      "GAUC": 0.6706587076187134,
+      "nDCG@5": 0.5374457240104675,
+      "primary": 0.6040521860122681,
+      "users": 22377,
+      "rows": 124909
+    },
+    "test": {
+      "GAUC": 0.6637696623802185,
+      "nDCG@5": 0.5308558344841003,
+      "primary": 0.5973127484321594,
+      "users": 23875,
+      "rows": 170588
+    }
+  },
+  "training_curve": null,
+  "prev_best_primary": 0.6040521860122681,
+  "new_primary": 0.6037158370018005,
+  "llm_calls": [
+    {
+      "cost_usd": 0.32859760000000005,
+      "ok": true,
+      "error": null
+    }
+  ],
+  "run_attempts": [
+    {
+      "attempt": 0,
+      "ok": true,
+      "error": null
+    }
+  ]
+}

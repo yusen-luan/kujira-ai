@@ -1,0 +1,26 @@
+{
+  "iter": 9,
+  "status": "researched",
+  "research_question": "For pairwise BPR training on sparse implicit feedback (as in Rendle's original BPR paper's own follow-up work, and later \"dynamic negative sampling\" / hard-negative-mining literature), is there a well-established, lightweight technique for selecting *harder* negatives \u2014 e.g. picking the highest-scoring same-user negative candidate from a small resampled pool each step, rather than a single uniform-random one \u2014 that reliably improves ranking metrics (AUC/nDCG) over uniform random negative sampling, and is it simple enough to implement with numpy only (re-scoring a small per-positive candidate pool each epoch, no external library)?",
+  "reflection": "The ESMM auxiliary-task variant landed at 0.6037, essentially matching but not beating the DeepFM attempt (0.6037) and both still below the current best (0.6041) \u2014 five iterations in a row (feature widening, L2 sweep, UBPR reweighting, DeepFM capacity, ESMM auxiliary task) have all failed to clear the BPR-FM baseline by more than noise, which is a real plateau signal rather than one-off bad luck. Given the strong nudge toward RESEARCH_QUESTION and that I haven't yet checked whether there's a better negative-sampling *mechanism* (as opposed to the propensity-reweighting variant I already tried and which badly hurt, iter 6) \u2014 specifically hard/dynamic negative mining based on the model's own current scores rather than uniform-random or popularity-based \u2014 this is worth spending my last research-question budget on before guessing another code variant.",
+  "note": {
+    "title": "Dynamic Negative Sampling (DNS) for pairwise BPR ranking",
+    "citation": "Zhang, Chen, Wang & Yu 2013, SIGIR (\"Optimizing Top-N Collaborative Filtering via Dynamic Negative Item Sampling\")",
+    "tags": "BPR, dynamic negative sampling, hard negative mining, pairwise ranking, implicit feedback, top-N recommendation, AUC, nDCG, sparse data, KuaiRand",
+    "source_url": "https://dl.acm.org/doi/10.1145/2484028.2484126",
+    "body": "Dynamic Negative Sampling (DNS), introduced by Zhang et al. (SIGIR 2013) as a follow-up to Rendle's BPR, replaces uniform-random negative sampling with a two-step scheme: for each positive (user, item) pair, draw a small pool of H\u22651 candidate items uniformly from the user's uninteracted items, score them all with the current model, and pick the highest-scoring one as the \"hard\" negative for that gradient step. This directly targets the informative region near the decision boundary (items the model currently ranks too high), which the paper shows yields significant AUC/top-N gains over uniform BPR sampling while also speeding convergence, since gradients from easy (already correctly-ranked) negatives are mostly wasted. Later theoretical work (arXiv 2302.03472, \"On the Theories Behind Hard Negative Sampling for Recommendation\") shows BPR+DNS acts as an exact one-way partial-AUC estimator, formalizing why it helps, and arXiv 2403.19276 discusses guarding against false negatives when H grows large \u2014 relevant caution for a popularity-skewed catalog like KuaiRand-Pure where popular unclicked videos can be false negatives rather than true dislikes. The technique is lightweight: it needs only re-scoring a small per-positive candidate pool (e.g. H=5\u201320) each training step/epoch via a forward pass and an argmax, so it is straightforward to implement with plain numpy (matrix-vector dot products for scores, np.argmax over the pool) with no external library, at the cost of H\u00d7 more score computations per positive sample than vanilla BPR."
+  },
+  "saved_path": "C:\\Users\\Yusen\\Desktop\\tiktok_techjam_2026\\agent\\runs\\web_literature\\9_dynamic_negative_sampling_dns_for_pairwise_bpr_ranking.md",
+  "llm_calls": [
+    {
+      "cost_usd": 0.1149056,
+      "ok": true,
+      "error": null
+    },
+    {
+      "cost_usd": 0.10570240000000002,
+      "ok": true,
+      "error": null
+    }
+  ]
+}

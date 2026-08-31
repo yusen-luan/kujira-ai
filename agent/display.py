@@ -132,10 +132,11 @@ def run_end(t0, ok, timed_out=False):
         print(f'  {_red("←")} run failed after {dt:.0f}s')
 
 
-def result_line(status, hypothesis, primary, prev_best, error_summary=None):
+def result_line(status, hypothesis, primary, prev_best, error_summary=None, significant=None):
     hyp = _trunc(hypothesis, 90)
     if status == 'accepted':
-        print(f'  {_green("ACCEPTED")}  primary {primary:.4f} (was {prev_best:.4f})  "{hyp}"')
+        sig_tag = '' if significant else f'  {_yellow("(insignificant)")}'
+        print(f'  {_green("ACCEPTED")}  primary {primary:.4f} (was {prev_best:.4f}){sig_tag}  "{hyp}"')
     elif status == 'rejected':
         print(f'  {_yellow("rejected")}  primary {primary:.4f} (best stays {prev_best:.4f})  "{hyp}"')
     else:
@@ -222,7 +223,8 @@ def _node_line(h):
     status = h.get('status')
     tag = f'[{h["iter"]}]'
     if status == 'accepted':
-        return (f'{tag} {_green("accepted")}  {h["primary"]:.4f}  "{_trunc(h.get("hypothesis"), 70)}"'
+        sig_tag = '' if h.get('significant') else f'  {_yellow("(insignificant)")}'
+        return (f'{tag} {_green("accepted")}  {h["primary"]:.4f}{sig_tag}  "{_trunc(h.get("hypothesis"), 70)}"'
                  f'{_sweep_tag(h)}{_variants_tag(h)}{_code_session_tag(h)}')
     if status == 'rejected':
         return (f'{tag} {_yellow("rejected")}  {h["primary"]:.4f}  "{_trunc(h.get("hypothesis"), 70)}"'

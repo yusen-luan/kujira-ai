@@ -1,0 +1,14 @@
+{
+  "n_valid_users": 22377,
+  "n_eligible_gauc_users": 12929,
+  "frac_eligible_gauc_users": 0.5777807570273048,
+  "gauc_point_popularity_baseline": 0.6424715222369642,
+  "ndcg_point_popularity_baseline": 0.522718093769906,
+  "primary_point_popularity_baseline": 0.5825948080034351,
+  "gauc_bootstrap_std": 0.0022894195773640307,
+  "ndcg_bootstrap_std": 0.002636940525403667,
+  "primary_bootstrap_std": 0.0017085218725168179,
+  "primary_bootstrap_p5": 0.5798127368794471,
+  "primary_bootstrap_p95": 0.5853421505510502,
+  "primary_bootstrap_range_p5_p95": 0.0055294136716030895
+}

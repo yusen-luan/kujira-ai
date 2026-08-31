@@ -1,24 +1,24 @@
 {
   "iter": 0,
-  "status": "last best",
+  "status": "baseline",
   "metrics": {
     "valid": {
-      "GAUC": 0.6709505319595337,
-      "nDCG@5": 0.5374008417129517,
-      "primary": 0.6041756868362427,
+      "GAUC": 0.6671333909034729,
+      "nDCG@5": 0.5358057022094727,
+      "primary": 0.6014695167541504,
       "users": 22377,
       "rows": 124909
     },
     "test": {
-      "GAUC": 0.665012001991272,
-      "nDCG@5": 0.5302592515945435,
-      "primary": 0.5976356267929077,
+      "GAUC": 0.6621216535568237,
+      "nDCG@5": 0.5285593271255493,
+      "primary": 0.5953404903411865,
       "users": 23875,
       "rows": 170588
     }
   },
   "preflight": {
     "torch_available": true,
-    "interpreter": "C:\\Users\\Yusen\\Desktop\\tiktok_techjam_2026\\.venv\\Scripts\\python.exe"
+    "interpreter": "C:\\Users\\Yusen\\anaconda3\\python.exe"
   }
 }
