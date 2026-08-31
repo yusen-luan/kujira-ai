@@ -6,27 +6,15 @@ LABEL = 'long_view'
 SPLITS = {'train': (20220408, 20220421),
           'valid': (20220422, 20220428),
           'test':  (20220429, 20220508)}
-# 6 个特征域。想加特征就往这里加 —— 这是学生最该动的地方之一。
-FIELDS = ['user_id', 'video_id', 'author_id', 'tab', 'dur_bucket', 'tag']
-
-def _clean_tag(raw):
-    if raw is None:
-        return 'UNK'
-    s = str(raw).strip()
-    if s == '' or s.lower() in ('nan', '-124'):
-        return 'UNK'
-    # video_features_basic_pure.csv stores a single numeric id per row here, but
-    # be defensive in case of an occasional comma-separated multi-tag value.
-    return s.split(',')[0].strip() or 'UNK'
+# 5 个特征域。想加特征就往这里加 —— 这是学生最该动的地方之一。
+FIELDS = ['user_id', 'video_id', 'author_id', 'tab', 'dur_bucket']
 
 def load(data_dir):
     """读日志 + 视频侧特征，返回按划分切好的 dict。"""
     vid2author = {}
-    vid2tag = {}
     with open(os.path.join(data_dir, 'video_features_basic_pure.csv')) as fh:
         for r in csv.DictReader(fh):
             vid2author[r['video_id']] = r['author_id']
-            vid2tag[r['video_id']] = _clean_tag(r.get('tag'))
 
     rows = []
     for f in ('log_standard_4_08_to_4_21_pure.csv', 'log_standard_4_22_to_5_08_pure.csv'):
@@ -34,9 +22,7 @@ def load(data_dir):
             for r in csv.DictReader(fh):
                 rows.append((int(r['date']), r['user_id'], r['video_id'],
                              vid2author.get(r['video_id'], 'UNK'), r['tab'],
-                             float(r['duration_ms']),
-                             vid2tag.get(r['video_id'], 'UNK'),
-                             1 if r[LABEL] != '0' else 0))
+                             float(r['duration_ms']), 1 if r[LABEL] != '0' else 0))
 
     out = {}
     for name, (lo, hi) in SPLITS.items():
@@ -53,7 +39,7 @@ def encode(splits):
     edges = _bucket_edges([x[5] for x in tr])
 
     def raw(x):
-        return [x[1], x[2], x[3], x[4], str(int(np.searchsorted(edges, x[5]))), x[6]]
+        return [x[1], x[2], x[3], x[4], str(int(np.searchsorted(edges, x[5])))]
 
     vocabs = [dict() for _ in FIELDS]
     for x in tr:
@@ -72,7 +58,7 @@ def encode(splits):
         for n, x in enumerate(rws):
             for i, v in enumerate(raw(x)):
                 X[n, i] = vocabs[i].get(v, unk[i]) + offsets[i]
-            y[n] = x[7]
+            y[n] = x[6]
             users.append(x[1])
         enc[name] = (X, y, users)
     return enc, int(sum(field_dims))

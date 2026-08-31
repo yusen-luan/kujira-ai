@@ -167,6 +167,24 @@ def explore_line(status, question, note_title=None):
         print(f'  {_magenta("repo explore")} {_red("nothing relevant found")}  "{_trunc(question, 90)}"')
 
 
+def eda_round_line(status, question, n_probes=None):
+    if status == 'eda_round':
+        print(f'  {_magenta("eda round")} {_green(f"{n_probes} new finding(s)")}  '
+              f'for "{_trunc(question, 60)}"')
+    elif status == 'eda_round_denied':
+        print(f'  {_magenta("eda round")} {_yellow("denied (budget exhausted)")}  "{_trunc(question, 90)}"')
+    else:
+        print(f'  {_magenta("eda round")} {_red("nothing new found")}  "{_trunc(question, 90)}"')
+
+
+def code_session_line(status, question):
+    """Only ever called for status == 'code_session_denied' -- an ATTEMPTED code session's
+    outcome (accepted/rejected/failed) already goes through result_line() like any other
+    hypothesis, so this only needs the one 'request denied' case (mirrors the *_denied
+    branch of research_line/explore_line/eda_round_line above)."""
+    print(f'  {_magenta("code session")} {_yellow("denied (budget exhausted)")}  "{_trunc(question, 90)}"')
+
+
 def converged(eps, n):
     print(f'  {_yellow("●")} converged: no >{eps} improvement over the last {n} nodes — stopping early')
 
@@ -196,15 +214,19 @@ def _variants_tag(h):
     return f'  [raced {len(variants)} variants, winner v{h.get("winning_variant")}, {n_ok}/{len(variants)} ran ok]'
 
 
+def _code_session_tag(h):
+    return '  [via code session]' if h.get('authored_via') == 'code_session' else ''
+
+
 def _node_line(h):
     status = h.get('status')
     tag = f'[{h["iter"]}]'
     if status == 'accepted':
         return (f'{tag} {_green("accepted")}  {h["primary"]:.4f}  "{_trunc(h.get("hypothesis"), 70)}"'
-                 f'{_sweep_tag(h)}{_variants_tag(h)}')
+                 f'{_sweep_tag(h)}{_variants_tag(h)}{_code_session_tag(h)}')
     if status == 'rejected':
         return (f'{tag} {_yellow("rejected")}  {h["primary"]:.4f}  "{_trunc(h.get("hypothesis"), 70)}"'
-                 f'{_sweep_tag(h)}{_variants_tag(h)}')
+                 f'{_sweep_tag(h)}{_variants_tag(h)}{_code_session_tag(h)}')
     if status == 'answered':
         return f'{tag} {_magenta("probe")}  "{_trunc(h.get("question"), 70)}"'
     if status == 'failed' and h.get('question') is not None:
@@ -215,6 +237,24 @@ def _node_line(h):
     if status in ('research_failed', 'research_denied'):
         why = 'denied' if status == 'research_denied' else 'no source'
         return f'{tag} {_red(f"web research {why}")}  "{_trunc(h.get("research_question"), 70)}"'
+    # explored/explore_*, eda_round/eda_round_*, code_session_denied: pre-existing gap found
+    # while adding the branches above -- these previously had no case here at all and fell
+    # straight through to the generic FAILED line below even on a genuine success, unrelated
+    # to v4 roadmap Phase 4 but directly adjacent, so fixed alongside rather than left in
+    # place (research_line's shape above already got this right; these three families didn't).
+    if status == 'explored':
+        return (f'{tag} {_magenta("repo explore")}  found "{_trunc(h.get("note_title"), 40)}" for '
+                 f'"{_trunc(h.get("explore_question"), 40)}"')
+    if status in ('explore_failed', 'explore_denied'):
+        why = 'denied' if status == 'explore_denied' else 'no source'
+        return f'{tag} {_red(f"repo explore {why}")}  "{_trunc(h.get("explore_question"), 70)}"'
+    if status == 'eda_round':
+        return f'{tag} {_magenta("eda round")}  "{_trunc(h.get("eda_round_question"), 70)}"'
+    if status in ('eda_round_failed', 'eda_round_denied'):
+        why = 'denied' if status == 'eda_round_denied' else 'nothing new'
+        return f'{tag} {_red(f"eda round {why}")}  "{_trunc(h.get("eda_round_question"), 70)}"'
+    if status == 'code_session_denied':
+        return f'{tag} {_red("code session denied")}  "{_trunc(h.get("code_session_question"), 70)}"'
     return f'{tag} {_red("FAILED")}  "{_trunc(h.get("hypothesis"), 70)}"'
 
 

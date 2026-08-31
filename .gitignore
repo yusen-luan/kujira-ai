@@ -27,6 +27,7 @@ agent/runs/*
 !agent/runs/literature_context.md
 !agent/runs/web_literature/
 !agent/runs/repo_notes/
+!agent/runs/eda_probes/
 !agent/runs/node_*/
 !agent/runs/node_0_metrics.json
 # still excluded by the agent/runs/* rule above (not negated): archive/, backup/

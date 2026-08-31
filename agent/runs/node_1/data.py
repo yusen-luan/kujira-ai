@@ -8,18 +8,9 @@ SPLITS = {'train': (20220408, 20220421),
           'test':  (20220429, 20220508)}
 # 特征域。想加特征就往这里加 —— 这是学生最该动的地方之一。
 FIELDS = ['user_id', 'video_id', 'author_id', 'tab', 'dur_bucket',
-          'user_active_degree', 'follow_user_num_range', 'fans_user_num_range',
-          'friend_user_num_range', 'register_days_range', 'is_live_streamer',
-          'is_video_author']
+          'user_active_degree', 'follow_user_num_range', 'fan_user_num_range', 'register_days_range']
 
-_UNK = 'UNK'
-
-def _clean_is_live_streamer(v):
-    try:
-        iv = int(v)
-    except (ValueError, TypeError):
-        return _UNK
-    return str(iv) if iv >= 0 else _UNK
+_UNK_STR = '__UNK__'
 
 def load(data_dir):
     """读日志 + 视频侧特征 + 用户侧特征，返回按划分切好的 dict。"""
@@ -31,20 +22,13 @@ def load(data_dir):
     uid2feat = {}
     with open(os.path.join(data_dir, 'user_features_pure.csv')) as fh:
         for r in csv.DictReader(fh):
-            uid2feat[r['user_id']] = {
-                'user_active_degree': r.get('user_active_degree', _UNK) or _UNK,
-                'follow_user_num_range': r.get('follow_user_num_range', _UNK) or _UNK,
-                'fans_user_num_range': r.get('fans_user_num_range', _UNK) or _UNK,
-                'friend_user_num_range': r.get('friend_user_num_range', _UNK) or _UNK,
-                'register_days_range': r.get('register_days_range', _UNK) or _UNK,
-                'is_live_streamer': _clean_is_live_streamer(r.get('is_live_streamer', '')),
-                'is_video_author': r.get('is_video_author', _UNK) or _UNK,
-            }
-    default_ufeat = {
-        'user_active_degree': _UNK, 'follow_user_num_range': _UNK,
-        'fans_user_num_range': _UNK, 'friend_user_num_range': _UNK,
-        'register_days_range': _UNK, 'is_live_streamer': _UNK, 'is_video_author': _UNK,
-    }
+            uid2feat[r['user_id']] = (
+                r.get('user_active_degree', _UNK_STR) or _UNK_STR,
+                r.get('follow_user_num_range', _UNK_STR) or _UNK_STR,
+                r.get('fan_user_num_range', _UNK_STR) or _UNK_STR,
+                r.get('register_days_range', _UNK_STR) or _UNK_STR,
+            )
+    default_ufeat = (_UNK_STR, _UNK_STR, _UNK_STR, _UNK_STR)
 
     rows = []
     for f in ('log_standard_4_08_to_4_21_pure.csv', 'log_standard_4_22_to_5_08_pure.csv'):
@@ -54,10 +38,7 @@ def load(data_dir):
                 rows.append((int(r['date']), r['user_id'], r['video_id'],
                              vid2author.get(r['video_id'], 'UNK'), r['tab'],
                              float(r['duration_ms']),
-                             uf['user_active_degree'], uf['follow_user_num_range'],
-                             uf['fans_user_num_range'], uf['friend_user_num_range'],
-                             uf['register_days_range'], uf['is_live_streamer'],
-                             uf['is_video_author'],
+                             uf[0], uf[1], uf[2], uf[3],
                              1 if r[LABEL] != '0' else 0))
 
     out = {}
@@ -76,7 +57,7 @@ def encode(splits):
 
     def raw(x):
         return [x[1], x[2], x[3], x[4], str(int(np.searchsorted(edges, x[5]))),
-                x[6], x[7], x[8], x[9], x[10], x[11], x[12]]
+                x[6], x[7], x[8], x[9]]
 
     vocabs = [dict() for _ in FIELDS]
     for x in tr:
@@ -95,7 +76,7 @@ def encode(splits):
         for n, x in enumerate(rws):
             for i, v in enumerate(raw(x)):
                 X[n, i] = vocabs[i].get(v, unk[i]) + offsets[i]
-            y[n] = x[13]
+            y[n] = x[10]
             users.append(x[1])
         enc[name] = (X, y, users)
     return enc, int(sum(field_dims))

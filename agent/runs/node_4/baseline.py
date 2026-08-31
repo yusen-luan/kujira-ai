@@ -1,8 +1,8 @@
 """KuaiRand-Pure baselines。
   --model pop   : item popularity（官方 baseline，纯统计，不训练）
-  --model fm    : Factorization Machine，pointwise BCE（原始起步模型）
+  --model fm    : Factorization Machine（起步模型，学生从这里往上改）
+  --model dfm   : DeepFM-lite (FM + small MLP head, pure numpy)
   --model random: 随机打分（下界，用来自检评测代码没坏）
-默认 run_model 走新的 BPR pairwise 训练流程（见 run_fm_bpr）。
 只依赖 numpy。用法见 README.md
 """
 import argparse, collections, time
@@ -35,7 +35,7 @@ def run_random(splits, seed=0):
                              rng.random(len(rws)))
     return out
 
-# ---------------- Factorization Machine (shared core) ----------------
+# ---------------- Factorization Machine (kept for CLI/back-compat) ----------------
 class FM:
     def __init__(self, dim, k=16, lr=0.001, l2=1e-6, seed=0):
         rng = np.random.default_rng(seed)
@@ -53,18 +53,6 @@ class FM:
         inter = 0.5 * ((S ** 2).sum(1) - (E ** 2).sum((1, 2)))
         return self.b + self.W[X].sum(1) + inter, E, S
 
-    def _adam_apply(self, gV, gW, gb):
-        gV = gV + self.l2 * self.V
-        gW = gW + self.l2 * self.W
-        self.t += 1
-        b1, b2, eps = 0.9, 0.999, 1e-8
-        for P, G, M, Vv in ((self.V, gV, self.mV, self.vV), (self.W, gW, self.mW, self.vW)):
-            M *= b1; M += (1 - b1) * G
-            Vv *= b2; Vv += (1 - b2) * (G * G)
-            P -= self.lr * (M / (1 - b1 ** self.t)) / (np.sqrt(Vv / (1 - b2 ** self.t)) + eps)
-        self.b -= self.lr * gb
-
-    # ---- pointwise BCE step (original) ----
     def step(self, X, y):
         B = len(y)
         z, E, S = self.logits(X)
@@ -72,31 +60,20 @@ class FM:
         gV = np.zeros_like(self.V); gW = np.zeros_like(self.W)
         np.add.at(gW, X, g[:, None])
         np.add.at(gV, X, g[:, None, None] * (S[:, None, :] - E))
-        self._adam_apply(gV, gW, float(g.sum()))
+        gV += self.l2 * self.V; gW += self.l2 * self.W
+        self.t += 1
+        b1, b2, eps = 0.9, 0.999, 1e-8
+        for P, G, M, Vv in ((self.V, gV, self.mV, self.vV), (self.W, gW, self.mW, self.vW)):
+            M *= b1; M += (1 - b1) * G
+            Vv *= b2; Vv += (1 - b2) * (G * G)
+            P -= self.lr * (M / (1 - b1 ** self.t)) / (np.sqrt(Vv / (1 - b2 ** self.t)) + eps)
+        self.b -= self.lr * g.sum()
         return float(-np.mean(y * np.log(sigmoid(z) + 1e-9) + (1 - y) * np.log(1 - sigmoid(z) + 1e-9)))
-
-    # ---- BPR pairwise step ----
-    def step_bpr(self, Xpos, Xneg):
-        B = len(Xpos)
-        zpos, Epos, Spos = self.logits(Xpos)
-        zneg, Eneg, Sneg = self.logits(Xneg)
-        d = zpos - zneg
-        p = sigmoid(d)
-        coef = ((p - 1.0) / B).astype(np.float32)         # dL/dz_pos
-        gV = np.zeros_like(self.V); gW = np.zeros_like(self.W)
-        np.add.at(gW, Xpos, coef[:, None])
-        np.add.at(gV, Xpos, coef[:, None, None] * (Spos[:, None, :] - Epos))
-        np.add.at(gW, Xneg, (-coef)[:, None])
-        np.add.at(gV, Xneg, (-coef)[:, None, None] * (Sneg[:, None, :] - Eneg))
-        self._adam_apply(gV, gW, 0.0)   # bias term cancels exactly in a difference
-        return float(np.mean(-np.log(p + 1e-9)))
 
     def predict(self, X, bs=200_000):
         return np.concatenate([self.logits(X[i:i + bs])[0] for i in range(0, len(X), bs)])
 
-
 def run_fm(splits, k=16, lr=0.001, epochs=40, bs=8192, patience=4, seed=0, verbose=True):
-    """Original pointwise-BCE training loop, kept for reference / --model fm CLI use."""
     enc, dim = encode(splits)
     Xtr, ytr, _ = enc['train']; Xva, yva, uva = enc['valid']; Xte, yte, ute = enc['test']
     m = FM(dim, k=k, lr=lr, seed=seed)
@@ -121,94 +98,188 @@ def run_fm(splits, k=16, lr=0.001, epochs=40, bs=8192, patience=4, seed=0, verbo
     return {'valid': evaluate(uva, yva, m.predict(Xva)),
             'test':  evaluate(ute, yte, m.predict(Xte))}
 
+# ---------------- DeepFM-lite: FM (linear + 2-way) + small MLP head, plain numpy ----------------
+# Trained with pointwise BCE plus an auxiliary within-batch BPR-style pairwise ranking
+# loss: rows are sorted by user id within each minibatch, adjacent same-user rows with
+# differing labels are paired, and a -log(sigmoid(z_pos - z_neg)) term is added, weighted
+# by `pairwise_weight`. This directly targets per-user ranking correctness (== GAUC),
+# on top of the pointwise calibration objective. pairwise_weight=0.0 reduces exactly to
+# the previous pointwise-only DeepFM.
+class DeepFM:
+    def __init__(self, dim, k=16, h=32, lr=0.001, l2=1e-6, seed=0):
+        rng = np.random.default_rng(seed)
+        self.dim, self.k, self.h = dim, k, h
+        self.V = rng.normal(0, 0.01, (dim, k)).astype(np.float32)
+        self.W = np.zeros(dim, dtype=np.float32)
+        self.b = np.float32(0.0)
+        self.lr, self.l2 = lr, l2
+        self.rng = rng
+        self.F = None  # number of fields, discovered lazily from first batch
+        self.W1 = self.b1 = self.W2 = self.b2 = None
+        self.mV = np.zeros_like(self.V); self.vV = np.zeros_like(self.V)
+        self.mW = np.zeros_like(self.W); self.vW = np.zeros_like(self.W)
+        self.t = 0
+        self._adam_mlp = {}
 
-def run_fm_bpr(splits, k=16, lr=0.001, epochs=40, bs=8192, patience=4, neg_k=1, seed=0, verbose=True):
-    """BPR pairwise-ranking training loop: for each positive training row, sample a
-    negative row from the SAME user (vectorized, no per-row python loop) and train on
-    -log(sigmoid(score_pos - score_neg)). Falls back to a global random negative for
-    users with no negative rows in train. Directly targets GAUC's own definition."""
+    def _init_mlp(self, F):
+        self.F = F
+        in_dim = F * self.k
+        self.W1 = self.rng.normal(0, 1.0 / np.sqrt(in_dim), (in_dim, self.h)).astype(np.float32)
+        self.b1 = np.zeros(self.h, dtype=np.float32)
+        self.W2 = self.rng.normal(0, 1.0 / np.sqrt(self.h), (self.h, 1)).astype(np.float32)
+        self.b2 = np.zeros(1, dtype=np.float32)
+        for name in ('W1', 'b1', 'W2', 'b2'):
+            p = getattr(self, name)
+            self._adam_mlp[name] = [np.zeros_like(p), np.zeros_like(p)]
+
+    def forward(self, X):
+        if self.F is None:
+            self._init_mlp(X.shape[1])
+        E = self.V[X]                                    # (B,F,k)
+        S = E.sum(1)                                      # (B,k)
+        fm_inter = 0.5 * ((S ** 2).sum(1) - (E ** 2).sum((1, 2)))
+        linear = self.b + self.W[X].sum(1)
+        B = X.shape[0]
+        embed_flat = E.reshape(B, self.F * self.k)
+        z1 = embed_flat @ self.W1 + self.b1               # (B,h)
+        h1 = np.maximum(z1, 0)
+        mlp_out = (h1 @ self.W2 + self.b2).reshape(-1)     # (B,)
+        logit = linear + fm_inter + mlp_out
+        return logit, E, S, embed_flat, h1, z1
+
+    def _adam_update(self, P, G, M, Vv):
+        b1c, b2c, eps = 0.9, 0.999, 1e-8
+        M *= b1c; M += (1 - b1c) * G
+        Vv *= b2c; Vv += (1 - b2c) * (G * G)
+        P -= self.lr * (M / (1 - b1c ** self.t)) / (np.sqrt(Vv / (1 - b2c ** self.t)) + eps)
+
+    def step(self, X, y, uid, pairwise_weight=0.0):
+        B = len(y)
+        z, E, S, embed_flat, h1, z1 = self.forward(X)
+        p = sigmoid(z)
+        g_bce = ((p - y) / B).astype(np.float32)            # (B,) per-row dL_bce/dz_i
+        bce_loss = float(-np.mean(y * np.log(p + 1e-9) + (1 - y) * np.log(1 - p + 1e-9)))
+
+        g_total = g_bce.copy()
+        pair_loss = 0.0
+        if pairwise_weight > 0:
+            order = np.argsort(uid, kind='stable')
+            uid_o = uid[order]
+            y_o = y[order]
+            same_user = uid_o[:-1] == uid_o[1:]
+            diff_label = y_o[:-1] != y_o[1:]
+            mask = same_user & diff_label
+            if mask.any():
+                idx_left = order[:-1][mask]
+                idx_right = order[1:][mask]
+                swap = y[idx_left] < y[idx_right]
+                idx_a = np.where(swap, idx_right, idx_left)     # positive member of pair
+                idx_b = np.where(swap, idx_left, idx_right)     # negative member of pair
+                n_pairs = len(idx_a)
+                diff = z[idx_a] - z[idx_b]
+                sig = sigmoid(diff)
+                pair_loss = float(-np.mean(np.log(sig + 1e-9)))
+                coef = pairwise_weight / n_pairs
+                ga = ((sig - 1.0) * coef).astype(np.float32)
+                gb = ((1.0 - sig) * coef).astype(np.float32)
+                np.add.at(g_total, idx_a, ga)
+                np.add.at(g_total, idx_b, gb)
+
+        gV = np.zeros_like(self.V); gW = np.zeros_like(self.W)
+        np.add.at(gW, X, g_total[:, None])
+        np.add.at(gV, X, g_total[:, None, None] * (S[:, None, :] - E))
+
+        gW2 = h1.T @ g_total[:, None]                             # (h,1)
+        gb2 = np.array([g_total.sum()], dtype=np.float32)
+        dh1 = g_total[:, None] @ self.W2.T                        # (B,h)
+        dz1 = dh1 * (z1 > 0)
+        gW1 = embed_flat.T @ dz1                            # (F*k,h)
+        gb1 = dz1.sum(0)
+        dembed = (dz1 @ self.W1.T).reshape(B, self.F, self.k)
+        np.add.at(gV, X, dembed)
+
+        gV += self.l2 * self.V; gW += self.l2 * self.W
+        gW1 = gW1 + self.l2 * self.W1
+        gW2 = gW2 + self.l2 * self.W2
+
+        self.t += 1
+        self._adam_update(self.V, gV, self.mV, self.vV)
+        self._adam_update(self.W, gW, self.mW, self.vW)
+        self.b -= self.lr * g_total.sum()
+        for name, G in (('W1', gW1), ('b1', gb1), ('W2', gW2), ('b2', gb2)):
+            P = getattr(self, name)
+            M, Vv = self._adam_mlp[name]
+            self._adam_update(P, G, M, Vv)
+
+        return bce_loss + pairwise_weight * pair_loss
+
+    def predict(self, X, bs=200_000):
+        outs = []
+        for i in range(0, len(X), bs):
+            z, *_ = self.forward(X[i:i + bs])
+            outs.append(z)
+        return np.concatenate(outs)
+
+
+def run_dfm(splits, k=16, mlp_hidden=32, lr=0.001, l2=1e-6, epochs=40, bs=8192, patience=4,
+            pairwise_weight=0.0, seed=0, verbose=True):
     enc, dim = encode(splits)
     Xtr, ytr, _ = enc['train']; Xva, yva, uva = enc['valid']; Xte, yte, ute = enc['test']
-    ytr_i = ytr.astype(np.int64)
-    user_col = Xtr[:, 0].astype(np.int64)                 # field 0 is user_id, offset 0
-
-    pos_row_idx = np.where(ytr_i == 1)[0]
-    neg_row_idx = np.where(ytr_i == 0)[0]
-    neg_users = user_col[neg_row_idx]
-
-    order = np.argsort(neg_users, kind='stable')
-    neg_row_idx_sorted = neg_row_idx[order]
-    neg_users_sorted = neg_users[order]
-    uniq_u, start_idx, counts = np.unique(neg_users_sorted, return_index=True, return_counts=True)
-
-    max_user = int(user_col.max()) + 1
-    neg_start = np.zeros(max_user, dtype=np.int64)
-    neg_count = np.zeros(max_user, dtype=np.int64)
-    neg_start[uniq_u] = start_idx
-    neg_count[uniq_u] = counts
-    n_neg_total = len(neg_row_idx_sorted)
-
-    m = FM(dim, k=k, lr=lr, seed=seed)
+    m = DeepFM(dim, k=k, h=mlp_hidden, lr=lr, l2=l2, seed=seed)
     rng = np.random.default_rng(seed)
     best, best_state, bad = -1, None, 0
-
-    def sample_negs(pos_idx_batch, rng):
-        u = user_col[pos_idx_batch]
-        u_clamped = np.clip(u, 0, max_user - 1)
-        cnt = neg_count[u_clamped]
-        has_neg = cnt > 0
-        offset = rng.integers(0, np.maximum(cnt, 1))
-        neg_pos = neg_start[u_clamped] + offset
-        neg_pos = np.clip(neg_pos, 0, n_neg_total - 1)
-        chosen = neg_row_idx_sorted[neg_pos]
-        n_missing = int((~has_neg).sum())
-        if n_missing > 0:
-            chosen = chosen.copy()
-            chosen[~has_neg] = neg_row_idx_sorted[rng.integers(0, n_neg_total, size=n_missing)]
-        return chosen
-
     for ep in range(1, epochs + 1):
-        order_pos = rng.permutation(len(pos_row_idx)); t0 = time.time()
+        idx = rng.permutation(len(ytr)); t0 = time.time()
         losses = []
-        for i in range(0, len(order_pos), bs):
-            pos_batch = pos_row_idx[order_pos[i:i + bs]]
-            neg_batch = sample_negs(pos_batch, rng)
-            for _ in range(max(1, neg_k)):
-                if neg_k > 1:
-                    neg_batch = sample_negs(pos_batch, rng)
-                losses.append(m.step_bpr(Xtr[pos_batch], Xtr[neg_batch]))
+        for i in range(0, len(idx), bs):
+            bidx = idx[i:i + bs]
+            Xb = Xtr[bidx]; yb = ytr[bidx]
+            uidb = Xb[:, 0]
+            losses.append(m.step(Xb, yb, uidb, pairwise_weight=pairwise_weight))
         va = evaluate(uva, yva, m.predict(Xva))
         if verbose:
             print(f"  epoch {ep:2d} | loss {np.mean(losses):.4f} | valid GAUC {va['GAUC']:.4f} "
                   f"nDCG@5 {va['nDCG@5']:.4f} primary {va['primary']:.4f} | {time.time()-t0:.1f}s")
         if va['primary'] > best + 1e-5:
             best, bad = va['primary'], 0
-            best_state = (m.V.copy(), m.W.copy(), np.float32(m.b))
+            best_state = (m.V.copy(), m.W.copy(), np.float32(m.b),
+                           m.W1.copy(), m.b1.copy(), m.W2.copy(), m.b2.copy())
         else:
             bad += 1
             if bad >= patience:
                 if verbose: print(f"  early stop at epoch {ep}")
                 break
-    m.V, m.W, m.b = best_state
+    m.V, m.W, m.b, m.W1, m.b1, m.W2, m.b2 = best_state
     return {'valid': evaluate(uva, yva, m.predict(Xva)),
             'test':  evaluate(ute, yte, m.predict(Xte))}
 
-
 def run_model(splits, hparams, seed=0, verbose=True):
     """Generic entrypoint the harness (run_and_report.py) always calls, regardless
-    of model family. Default: BPR pairwise-ranking FM training (see run_fm_bpr)."""
-    kwargs = dict(hparams)
-    kwargs.pop('bpr', None)
-    return run_fm_bpr(splits, seed=seed, verbose=verbose, **kwargs)
+    of model family. Default: DeepFM-lite (FM + small MLP head) trained with pointwise
+    BCE plus an auxiliary within-batch BPR-style pairwise ranking loss, reading hparams
+    generically via .get with sensible defaults so unrelated/missing keys are safe."""
+    kwargs = dict(
+        k=hparams.get('k', 16),
+        mlp_hidden=hparams.get('mlp_hidden', 32),
+        lr=hparams.get('lr', 0.001),
+        l2=hparams.get('l2', 1e-6),
+        epochs=hparams.get('epochs', 40),
+        bs=hparams.get('bs', 8192),
+        patience=hparams.get('patience', 4),
+        pairwise_weight=hparams.get('pairwise_weight', 0.5),
+    )
+    return run_dfm(splits, seed=seed, verbose=verbose, **kwargs)
 
 if __name__ == '__main__':
     ap = argparse.ArgumentParser()
     ap.add_argument('--data_dir', default='./KuaiRand-Pure/data',
                     help='KuaiRand-Pure 解压后的 data 目录')
-    ap.add_argument('--model', default='bpr', choices=['pop', 'fm', 'bpr', 'random'])
+    ap.add_argument('--model', default='dfm', choices=['pop', 'fm', 'dfm', 'random'])
     ap.add_argument('--k', type=int, default=16)
+    ap.add_argument('--mlp_hidden', type=int, default=32)
     ap.add_argument('--lr', type=float, default=0.001)
     ap.add_argument('--epochs', type=int, default=40)
+    ap.add_argument('--pairwise_weight', type=float, default=0.5)
     ap.add_argument('--seed', type=int, default=0)
     a = ap.parse_args()
     print(f"loading {a.data_dir} ...")
@@ -216,7 +287,9 @@ if __name__ == '__main__':
     print({k_: len(v) for k_, v in splits.items()}, f"fields={FIELDS}")
     res = {'pop': run_pop, 'random': lambda s: run_random(s, a.seed),
            'fm': lambda s: run_fm(s, k=a.k, lr=a.lr, epochs=a.epochs, seed=a.seed),
-           'bpr': lambda s: run_fm_bpr(s, k=a.k, lr=a.lr, epochs=a.epochs, seed=a.seed)}[a.model](splits)
+           'dfm': lambda s: run_dfm(s, k=a.k, mlp_hidden=a.mlp_hidden, lr=a.lr, epochs=a.epochs,
+                                     pairwise_weight=a.pairwise_weight, seed=a.seed),
+           }[a.model](splits)
     print(f"\n=== {a.model} (seed={a.seed}) ===")
     for sp in ('valid', 'test'):
         r = res[sp]

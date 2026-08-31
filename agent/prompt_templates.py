@@ -49,6 +49,46 @@ not an external classifier call):
      verified to actually exist under the repo root) merged into the same
      local corpus agent/rag.py retrieves from, same as a research note.
      Drawn from a small separate --explore_budget pool.
+  3c. Ask for a new EDA_ROUND_REQUEST instead (REFLECTION + EDA_ROUND_REQUEST,
+     no code) -- v4 roadmap Phase 2. agent/eda.py's deterministic report and
+     first agentic-EDA pass run once at startup, but the propose LLM itself
+     can request ANOTHER round mid-run if it suspects recent lack of progress
+     is a *data-understanding* gap rather than a *modeling* gap -- the streak/
+     escalation context already in this prompt is exactly the signal it needs
+     to make that call. Routed to agent/eda_agent.py's exploration loop (write
+     a probe.py -> run it through eda_probe.py's fixed harness, same
+     mechanism PROBE_QUESTION above uses, via agent/probe_runner.py -- but
+     genuinely iterative: it can look at one result and decide to look
+     further, not just repair-on-failure), whose accumulated findings get
+     folded into a freshly regenerated eda_summary.md so they persist into
+     every future propose prompt without needing to be re-discovered. Drawn
+     from a small separate --eda_round_budget pool.
+  3d. Ask for a CODE_SESSION_REQUEST instead of committing to a one-shot full-file
+     hypothesis -- v4 roadmap Phase 4. Every option above still hands the LLM zero
+     tools -- it proposes a full replacement file body once, blind, and only finds
+     out if it runs via the repair loop after the fact. This option instead routes
+     to agent/code_agent.py (via llm.call_claude_code()), a bounded MULTI-TURN
+     session that grants Read/Grep/Glob/Edit/Write -- genuinely confined to one
+     candidate node directory under --restricted (verified live: a cwd-confined
+     session was refused on a relative-path read one directory outside it) -- so it
+     can read the current data.py/baseline.py, edit them directly, and iterate
+     before handing off, rather than guessing a whole file at once. Deliberately no
+     Bash grant: also verified live that --restricted's cwd-confinement does NOT
+     extend to Bash (a restricted session with Bash granted read a file outside its
+     cwd via `cat ../...` without issue) -- Bash's actual reach is the OS user's
+     full filesystem regardless of cwd, fine for a human-watched interactive
+     session but not for this orchestrator's unattended runs, so this option trades
+     away in-session diagnostics (already covered by EXPLORE_QUESTION/PROBE_QUESTION
+     above) for keeping the same real confinement guarantee every other tool-granted
+     role here relies on. The session ends with the same REFLECTION/HYPOTHESIS/
+     EXPECTED_EFFECT/LEVER_CATEGORY text contract as option 1, just with no fenced
+     file blocks -- the files are already edited on disk, so orchestrator.py reads
+     them straight from the candidate directory afterward and feeds the result
+     through the exact same run_and_repair() -> accept/reject path option 1 uses,
+     rather than a parallel status family. Drawn from a small separate
+     --code_session_budget pool. Not the default/common path -- worth the extra
+     cost mainly for a change gnarly enough that reading-while-editing genuinely
+     helps, not a small, easily-specified-in-one-shot change.
   4. Race MAX_VARIANTS (default 3) structurally different hypothesis+code
      variants in parallel instead of committing to one (REFLECTION + a
      `VARIANT N:`-tagged block per idea, each with its own HYPOTHESIS/
@@ -205,21 +245,30 @@ def _load_model_zoo_reference():
     return "\n\n".join(parts)
 
 
-_CONTRACT = """Hard constraints you must preserve, because a fixed harness calls into these files \
+_TORCH_AVAILABLE_LINE = ("- numpy and the Python standard library only in data.py. torch and torchfm are "
+    "additionally allowed in baseline.py (not in data.py) if you're proposing a model/architecture "
+    "change — both are installed. No other new pip dependencies, no internet access.")
+_TORCH_UNAVAILABLE_LINE = ("- numpy and the Python standard library only, in both data.py and "
+    "baseline.py. torch and torchfm are NOT importable in this run's environment (checked at "
+    "startup) — do NOT propose a hypothesis that imports either; a model/architecture change must "
+    "be implemented in plain numpy instead. No other new pip dependencies, no internet access.")
+
+
+def _build_contract(torch_available):
+    torch_line = _TORCH_AVAILABLE_LINE if torch_available else _TORCH_UNAVAILABLE_LINE
+    return f"""Hard constraints you must preserve, because a fixed harness calls into these files \
 directly and cannot be changed:
 - data.py must keep a `load(data_dir)` function returning the same split dict shape, \
 and an `encode(splits)` function returning `(enc, dim)` where `enc[name] = (X, y, users)`.
 - baseline.py must keep a `run_model(splits, hparams: dict, seed=0, verbose=True)` \
-function returning `{'valid': {...}, 'test': {...}}` (each a dict with GAUC, nDCG@5, \
+function returning `{{'valid': {{...}}, 'test': {{...}}}}` (each a dict with GAUC, nDCG@5, \
 primary) — this is the fixed entrypoint the harness calls, so it must exist with this \
 exact name and signature no matter what else you change. The harness always passes the \
 same generic hparams dict regardless of what kind of change you're making, so don't assume \
 it contains any particular keys — read what you need via `hparams.get(name, default)` with \
 sensible defaults, and don't raise if a key you'd expect is missing or one you don't use \
 is present.
-- numpy and the Python standard library only in data.py. torch and torchfm are additionally \
-allowed in baseline.py (not in data.py) if you're proposing a model/architecture change — both \
-are installed. No other new pip dependencies, no internet access.
+{torch_line}
 - Mind the wall-clock budget: any candidate that touches baseline.py's training procedure must \
 finish within the run timeout on CPU (no GPU available) — keep epoch count and model size modest. \
 A smaller/faster model that actually finishes and beats the current best is better than a bigger \
@@ -285,7 +334,7 @@ to explain the label with), fast (well under a minute on CPU — compute exactly
 question), and return a small number of named statistics, not raw arrays or large tables, since \
 this gets pasted verbatim into future prompts."""
 
-_OUTPUT_FORMAT = f"""Output format, exactly one of the following five:
+_OUTPUT_FORMAT = f"""Output format, exactly one of the following seven:
 
 1) Propose a hypothesis and code change:
 
@@ -360,7 +409,36 @@ repo -- e.g. "is there already a script comparing how many encoded fields the FM
 -- answerable by reading this codebase, not by computing something over the raw data or searching \
 the web>
 
-5) OR, instead of committing to one hypothesis, race 2 to {MAX_VARIANTS} DIFFERENT hypotheses in \
+5) OR, instead, request a new EDA_ROUND_REQUEST (only if you suspect recent lack of progress is a \
+*data-understanding* gap rather than a *modeling* gap -- e.g. you're plateaued, or your last few \
+EXPECTED_EFFECT predictions have been wrong in a way that suggests you're missing something about \
+the data itself, not just picking weak mechanisms. This triggers a fresh, genuinely exploratory \
+round of read-only data probing -- distinct from option 2 above, which answers one question you \
+already know to ask; this instead lets a separate pass look around and decide for itself what's \
+worth checking, then folds whatever it finds into the EDA summary below for good, so don't use this \
+for a question you can already state precisely -- that's a probe. Only available if the budget line \
+below shows at least one remaining:
+
+REFLECTION: <same as above>
+
+EDA_ROUND_REQUEST: <1-2 sentences: why you suspect a data-understanding gap right now, tying it to \
+what just happened (a plateau, a wrong prediction, an unexpected result) -- this is given to the \
+exploration round as its starting focus>
+
+6) OR, instead of guessing a full replacement file body in one shot, request a CODE_SESSION_REQUEST \
+-- a bounded multi-turn session that can read the current data.py/baseline.py and edit them \
+directly, iterating before handing off (rather than you writing a whole file blind and only \
+finding out if it runs via the repair loop after). Worth it mainly for a change gnarly/unfamiliar \
+enough that reading-while-editing genuinely helps -- not the default choice for an easily-specified \
+small change, which is still cheaper and just as effective as a normal hypothesis turn. Only \
+available if the budget line below shows at least one remaining:
+
+REFLECTION: <same as above>
+
+CODE_SESSION_REQUEST: <1-2 sentences: what you want changed and why a multi-turn read-edit session \
+is worth it for this particular change -- this is given to the session as its starting context>
+
+7) OR, instead of committing to one hypothesis, race 2 to {MAX_VARIANTS} DIFFERENT hypotheses in \
 parallel this turn -- worth doing when you have several genuinely distinct, comparably promising \
 ideas and aren't sure which is best, especially when plateaued and unsure whether the right lever is \
 a feature, the model, or the training procedure. The harness runs every variant once at default \
@@ -401,13 +479,21 @@ LEVER_CATEGORY: <required>
 (up to {MAX_VARIANTS} variants total; each variant's fenced blocks are independent full-file \
 rewrites starting from the CURRENT best code shown below, not diffs against each other)
 
-Output nothing else outside one of these five formats — no preamble, no explanation after the code, \
-and never combine HYPOTHESIS, PROBE_QUESTION, RESEARCH_QUESTION, EXPLORE_QUESTION, or VARIANT blocks \
-in the same response (a multi-variant response uses ONLY VARIANT blocks, no top-level HYPOTHESIS/ \
-PROBE_QUESTION/RESEARCH_QUESTION/EXPLORE_QUESTION line)."""
+Output nothing else outside one of these seven formats — no preamble, no explanation after the code, \
+and never combine HYPOTHESIS, PROBE_QUESTION, RESEARCH_QUESTION, EXPLORE_QUESTION, EDA_ROUND_REQUEST, \
+CODE_SESSION_REQUEST, or VARIANT blocks in the same response (a multi-variant response uses ONLY \
+VARIANT blocks, no top-level HYPOTHESIS/PROBE_QUESTION/RESEARCH_QUESTION/EXPLORE_QUESTION/ \
+EDA_ROUND_REQUEST/CODE_SESSION_REQUEST line)."""
 
 
-SYSTEM_PROMPT = f"""You are an ML engineering agent iterating on a recommendation-ranking baseline \
+def build_system_prompt(torch_available=True):
+    """torch_available comes from orchestrator.py's startup preflight (v4 roadmap Phase 3a):
+    checked once in the exact interpreter agent/run_and_report.py's subprocess will use, so the
+    propose/repair role never asserts an installed-package claim that isn't actually true this
+    run -- see _build_contract()/_TORCH_UNAVAILABLE_LINE above. Recomputed per call (not cached)
+    since the model-zoo reference and contract text are cheap to rebuild and torch_available can
+    legitimately differ across calls only in tests, never within one real orchestrator run."""
+    return f"""You are an ML engineering agent iterating on a recommendation-ranking baseline \
 (KuaiRand-Pure). Each turn, look at the CURRENT full pipeline — data.py's feature engineering AND \
 baseline.py's model/training procedure together, not a pre-assigned axis — and decide where the \
 single highest-leverage next move is: a feature/preprocessing change, a model/architecture change, \
@@ -422,7 +508,7 @@ changes the mechanism (e.g. a new architecture with more capacity, or a new loss
 reasoned case for retrying an old idea is legitimate. This is an option to weigh, not an obligation — \
 don't retry old ideas by default or just for coverage.
 
-{_CONTRACT}
+{_build_contract(torch_available)}
 
 {_PROBE_CONTRACT}
 
@@ -446,6 +532,86 @@ Reference model zoo (only relevant if you're proposing a model/architecture chan
 field_dims/embed_dim-style constructors, takes a LongTensor of shape (batch, num_fields)):
 
 {_load_model_zoo_reference()}"""
+
+
+def build_code_session_system_prompt(torch_available=True):
+    """v4 roadmap Phase 4. Unlike build_system_prompt() above, this role has real Read/Grep/
+    Glob/Edit/Write tools (via llm.call_claude_code(), cwd-confined to one candidate node
+    directory -- see that function's docstring for why Bash is deliberately never granted
+    here) and runs as its own bounded multi-turn `claude -p` session, not a single text
+    completion. It shares the exact same rules (_build_contract) and lever taxonomy as the
+    plain propose role -- the only real difference is HOW the change gets made (reading and
+    editing files directly instead of guessing a whole replacement body in one shot) and
+    that its final hand-off is metadata-only text, since the file changes are already on
+    disk via its own tool calls by the time it finishes."""
+    return f"""You are an ML engineering agent making ONE focused, attributable change to a \
+recommendation-ranking baseline (KuaiRand-Pure), working directly in a candidate directory that \
+already contains the current best `data.py` and `baseline.py`.
+
+You have Read/Grep/Glob/Edit/Write tools, confined to your working directory — you do NOT have \
+Bash, PowerShell, or any other code-execution/network tool, and you cannot reach any file outside \
+this directory. Nothing you edit is scored by you; a separate, fixed harness runs your finished \
+candidate afterward exactly the way it runs every other candidate.
+
+Workflow: Read `data.py` and `baseline.py` first (don't guess their current contents from the \
+summary below). Make your one change directly with Edit/Write. Re-read whatever you touched if \
+you want to double-check it before finishing — you have several turns available, not just one \
+shot. When you are done, your FINAL message must be exactly this and nothing else — no fenced \
+code blocks (your edits are already saved to disk, that IS the change):
+
+REFLECTION: <1-3 sentences, same as a normal propose turn — what you learned from the run context \
+below and what you did>
+HYPOTHESIS: <the one change you made, stated as a hypothesis about why it should help>
+EXPECTED_EFFECT: <1 sentence: the metric effect you expect and why>
+LEVER_CATEGORY: <exactly one of the categories below>
+
+{_build_contract(torch_available)}
+
+{_LEVER_TAXONOMY}
+
+Why this session was requested (the propose role's own stated reason — treat it as your starting \
+brief, not a rigid spec) and the same grounding context a normal propose turn gets (EDA facts, \
+literature, probe findings, run history) are given to you below. Sweeping a hyperparameter \
+(SWEEP_PARAM/SWEEP_VALUES) is not supported in this mode — commit to one value."""
+
+
+def build_code_session_prompt(best_code, history, context_note):
+    """User-prompt for a code session -- reuses the same private context-loader helpers
+    build_propose_prompt() uses (EDA/literature/probes/history) rather than duplicating
+    them, so the two prompts never drift out of sync on what "current context" means.
+    best_code is shown for reference only (the session's actual working copy is what's on
+    disk in its cwd, which is what it must Read and Edit -- this is just so the model
+    doesn't have to Read before it can start reasoning about what to change)."""
+    eda_txt = _load_eda_summary()
+    lit_txt = _load_literature_context()
+    probe_txt = _load_probe_findings()
+    hist_txt = _format_history(history)
+    return f"""Why this session was requested: {context_note or '(no reason given)'}
+
+Data facts from EDA (computed once, directly from the real CSVs -- treat as ground truth):
+{eda_txt}
+
+Findings from targeted diagnostic probes run so far (also ground truth):
+{probe_txt}
+
+Relevant published methods (retrieved from a local corpus):
+{lit_txt}
+
+History of past iterations (for context — avoid repeating what's already been tried):
+{hist_txt}
+
+For reference, the current data.py and baseline.py (read the actual files in your working \
+directory before editing them — this is only so you don't have to Read before starting to think \
+about what to change):
+```python
+{best_code['data.py']}
+```
+```python
+{best_code['baseline.py']}
+```
+
+Begin: read the files in your working directory, make your one change, then finish with the \
+REFLECTION/HYPOTHESIS/EXPECTED_EFFECT/LEVER_CATEGORY format from your instructions."""
 
 
 def _format_sweep(h):
@@ -498,12 +664,14 @@ def _format_history_entry(h):
                 f"{_format_variants(h)}")
     if status == 'accepted':
         cat = f" [{h['lever_category']}]" if h.get('lever_category') else ''
-        return (f"iter {h['iter']}: ACCEPTED{cat} \"{h['hypothesis']}\"{_format_sweep(h)} "
+        session_note = ' (via multi-turn coding session)' if h.get('authored_via') == 'code_session' else ''
+        return (f"iter {h['iter']}: ACCEPTED{cat} \"{h['hypothesis']}\"{_format_sweep(h)}{session_note} "
                 f"-> primary {h['primary']:.4f} (was {h['prev_best']:.4f})")
     if status == 'rejected':
         cat = f" [{h['lever_category']}]" if h.get('lever_category') else ''
+        session_note = ' (via multi-turn coding session)' if h.get('authored_via') == 'code_session' else ''
         return (f"iter {h['iter']}: rejected{cat} (no improvement) \"{h['hypothesis']}\""
-                f"{_format_sweep(h)} -> primary {h['primary']:.4f} (best stays {h['prev_best']:.4f})")
+                f"{_format_sweep(h)}{session_note} -> primary {h['primary']:.4f} (best stays {h['prev_best']:.4f})")
     if status == 'answered':
         return f"iter {h['iter']}: PROBE \"{h.get('question', '')}\" -> see diagnostic probe findings below"
     if status == 'failed' and h.get('question') is not None:
@@ -526,6 +694,18 @@ def _format_history_entry(h):
     if status == 'explore_denied':
         return (f"iter {h['iter']}: explore budget was already exhausted, request "
                 f"denied \"{h.get('explore_question', '')}\"")
+    if status == 'eda_round':
+        return (f"iter {h['iter']}: EDA ROUND \"{h.get('eda_round_question', '')}\" "
+                f"-> see updated EDA summary above")
+    if status == 'eda_round_failed':
+        return (f"iter {h['iter']}: EDA round FAILED (exploration loop found nothing new) "
+                f"\"{h.get('eda_round_question', '')}\"")
+    if status == 'eda_round_denied':
+        return (f"iter {h['iter']}: EDA round budget was already exhausted, request "
+                f"denied \"{h.get('eda_round_question', '')}\"")
+    if status == 'code_session_denied':
+        return (f"iter {h['iter']}: code session budget was already exhausted, request "
+                f"denied \"{h.get('code_session_question', '')}\"")
     return f"iter {h['iter']}: FAILED after retries \"{h.get('hypothesis')}\" -> {h.get('error_summary')}"
 
 
@@ -541,7 +721,9 @@ def _format_history_compact(h):
     cat = f" [{h['lever_category']}]" if h.get('lever_category') else ''
     if status in ('accepted', 'rejected'):
         raced = f" (raced {len(h['variants'])})" if h.get('variants') else ''
-        return f"iter {h['iter']}: {status}{cat}{raced} \"{_trunc(h.get('hypothesis'))}\" -> {h['primary']:.4f}"
+        session_note = ' (via code session)' if h.get('authored_via') == 'code_session' else ''
+        return (f"iter {h['iter']}: {status}{cat}{raced}{session_note} "
+                f"\"{_trunc(h.get('hypothesis'))}\" -> {h['primary']:.4f}")
     if status == 'answered':
         return f"iter {h['iter']}: probe -> \"{_trunc(h.get('question'))}\""
     if status == 'failed' and h.get('question') is not None:
@@ -558,6 +740,14 @@ def _format_history_compact(h):
         return f"iter {h['iter']}: repo explore -> nothing relevant found"
     if status == 'explore_denied':
         return f"iter {h['iter']}: repo explore -> denied (budget exhausted)"
+    if status == 'eda_round':
+        return f"iter {h['iter']}: EDA round -> \"{_trunc(h.get('eda_round_question'))}\""
+    if status == 'eda_round_failed':
+        return f"iter {h['iter']}: EDA round -> found nothing new"
+    if status == 'eda_round_denied':
+        return f"iter {h['iter']}: EDA round -> denied (budget exhausted)"
+    if status == 'code_session_denied':
+        return f"iter {h['iter']}: code session -> denied (budget exhausted)"
     return f"iter {h['iter']}: FAILED{cat} -> \"{_trunc(h.get('hypothesis'))}\""
 
 
@@ -597,7 +787,8 @@ def _format_reflection_block(history):
     for h in reversed(history):
         if h.get('status') in ('accepted', 'rejected', 'failed', 'answered',
                                 'researched', 'research_failed', 'research_denied',
-                                'explored', 'explore_failed', 'explore_denied'):
+                                'explored', 'explore_failed', 'explore_denied',
+                                'eda_round', 'eda_round_failed', 'eda_round_denied'):
             last = h
             break
     if last is None:
@@ -624,6 +815,17 @@ def _format_reflection_block(history):
                   else 'the explore budget was already exhausted')
         return (f"Your last iteration asked an explore question rather than proposing a "
                 f"change: \"{last.get('explore_question')}\" — but {reason}, so nothing new is "
+                f"available; propose a hypothesis or probe based on what's already known instead.")
+    if last['status'] == 'eda_round':
+        return (f"Your last iteration requested a new EDA round rather than proposing a "
+                f"change: \"{last.get('eda_round_question')}\" — its findings are already folded "
+                f"into the EDA summary above, so use that directly rather than re-asking.")
+    if last['status'] in ('eda_round_failed', 'eda_round_denied'):
+        reason = ('the exploration loop finalized without finding anything new'
+                  if last['status'] == 'eda_round_failed'
+                  else 'the EDA round budget was already exhausted')
+        return (f"Your last iteration requested a new EDA round rather than proposing a "
+                f"change: \"{last.get('eda_round_question')}\" — but {reason}, so nothing new is "
                 f"available; propose a hypothesis or probe based on what's already known instead.")
     if last.get('variants'):
         lines = [f"You raced {len(last['variants'])} parallel variants last turn; the winner was: "
@@ -819,7 +1021,8 @@ def _format_escalation(streak, escalate_after, eps, history, web_research_remain
 
 
 def build_propose_prompt(best_code, history, best_primary, streak, escalate_after, converge_eps,
-                          web_research_remaining=0, explore_remaining=0, alt_node_id=None, alt_code=None):
+                          web_research_remaining=0, explore_remaining=0, eda_round_remaining=0,
+                          code_session_remaining=0, alt_node_id=None, alt_code=None):
     hist_txt = _format_history(history)
     eda_txt = _load_eda_summary()
     lit_txt = _load_literature_context()
@@ -868,6 +1071,14 @@ Repo-explore budget remaining this run: {explore_remaining} (see the EXPLORE_QUE
 your instructions -- only choose it if this is at least 1, and only for a question about what \
 already exists in THIS codebase that the context above doesn't already answer).
 
+EDA-round budget remaining this run: {eda_round_remaining} (see the EDA_ROUND_REQUEST option in \
+your instructions -- only choose it if this is at least 1, and only when you suspect a genuine \
+data-understanding gap, not just to double-check something the EDA facts above already cover).
+
+Code-session budget remaining this run: {code_session_remaining} (see the CODE_SESSION_REQUEST \
+option in your instructions -- only choose it if this is at least 1, and only for a change gnarly \
+enough that reading-while-editing genuinely helps over guessing a full file body in one shot).
+
 Current best validation primary metric: {best_primary:.4f}
 
 Past candidates ranked by their own valid primary (regardless of accept/reject -- some rejected \
@@ -915,11 +1126,28 @@ EXPECTED_EFFECT, or PROBE_QUESTION line needed for a repair."""
 
 
 _FENCE_RE = re.compile(r"```python:([^\n`]+)\n(.*?)```", re.DOTALL)
+
+
+def parse_fenced_files(text):
+    """Extracts every ```python:<filename>\\n...``` fenced block into {filename: content},
+    stripping one trailing newline per block. Shared by parse_response(),
+    _parse_variant_chunk(), and eda_agent.py's own turn parser."""
+    files = {}
+    for m in _FENCE_RE.finditer(text):
+        fname = m.group(1).strip()
+        content = m.group(2)
+        if content.endswith("\n"):
+            content = content[:-1]
+        files[fname] = content
+    return files
+
 _REFLECTION_RE = re.compile(
     r"REFLECTION:\s*(.*?)(?:\n\s*(?:HYPOTHESIS:|PROBE_QUESTION:|RESEARCH_QUESTION:|EXPLORE_QUESTION:|"
-    r"VARIANT\s+\d+:)|\Z)",
-    re.DOTALL)  # RESEARCH_QUESTION/EXPLORE_QUESTION/VARIANT stops were missing before this fix --
-                # reflection text could previously run on and swallow a following line
+    r"EDA_ROUND_REQUEST:|CODE_SESSION_REQUEST:|VARIANT\s+\d+:)|\Z)",
+    re.DOTALL)  # RESEARCH_QUESTION/EXPLORE_QUESTION/EDA_ROUND_REQUEST/CODE_SESSION_REQUEST/VARIANT
+                # stops were missing before this fix -- reflection text could previously run on
+                # and swallow a following line (CODE_SESSION_REQUEST added for v4 roadmap Phase 4,
+                # same bug class as the others -- see _NEXT_LABEL below)
 _HYPOTHESIS_RE = re.compile(r"HYPOTHESIS:\s*(.*?)(?:\n\s*EXPECTED_EFFECT:|\n```|\Z)", re.DOTALL)
 _EXPECTED_EFFECT_RE = re.compile(
     r"EXPECTED_EFFECT:\s*(.*?)(?:\n\s*(?:LEVER_CATEGORY:|SWEEP_PARAM:)|\n```|\Z)", re.DOTALL)
@@ -930,10 +1158,13 @@ _LEVER_CATEGORY_RE = re.compile(r"LEVER_CATEGORY:\s*(.*?)(?:\n\s*SWEEP_PARAM:|\n
 # but a code fence or end-of-string) -- now each stops at any OTHER label too, so a garbled
 # response at least yields two separately-truncated (if useless) captures instead of one
 # swallowing the rest of the text.
-_NEXT_LABEL = r"(?:\n\s*(?:HYPOTHESIS:|PROBE_QUESTION:|RESEARCH_QUESTION:|EXPLORE_QUESTION:|VARIANT\s+\d+:)|\n```|\Z)"
+_NEXT_LABEL = (r"(?:\n\s*(?:HYPOTHESIS:|PROBE_QUESTION:|RESEARCH_QUESTION:|EXPLORE_QUESTION:|"
+               r"EDA_ROUND_REQUEST:|CODE_SESSION_REQUEST:|VARIANT\s+\d+:)|\n```|\Z)")
 _PROBE_QUESTION_RE = re.compile(r"PROBE_QUESTION:\s*(.*?)" + _NEXT_LABEL, re.DOTALL)
 _RESEARCH_QUESTION_RE = re.compile(r"RESEARCH_QUESTION:\s*(.*?)" + _NEXT_LABEL, re.DOTALL)
 _EXPLORE_QUESTION_RE = re.compile(r"EXPLORE_QUESTION:\s*(.*?)" + _NEXT_LABEL, re.DOTALL)
+_EDA_ROUND_REQUEST_RE = re.compile(r"EDA_ROUND_REQUEST:\s*(.*?)" + _NEXT_LABEL, re.DOTALL)
+_CODE_SESSION_REQUEST_RE = re.compile(r"CODE_SESSION_REQUEST:\s*(.*?)" + _NEXT_LABEL, re.DOTALL)
 _SWEEP_PARAM_RE = re.compile(r"SWEEP_PARAM:\s*(.*?)(?:\n\s*SWEEP_VALUES:|\n```|\Z)", re.DOTALL)
 _SWEEP_VALUES_RE = re.compile(r"SWEEP_VALUES:\s*(.*?)(?:\n```|\Z)", re.DOTALL)
 _VARIANT_HEADER_RE = re.compile(r"\n\s*VARIANT\s+(\d+):\s*\n")
@@ -979,13 +1210,7 @@ def _parse_variant_chunk(chunk):
             sweep_values = _parse_sweep_values(sweep_values_match.group(1))
         if not sweep_values:
             sweep_param = ""  # SWEEP_PARAM without any usable values -- treat as no sweep
-    files = {}
-    for m in _FENCE_RE.finditer(chunk):
-        fname = m.group(1).strip()
-        content = m.group(2)
-        if content.endswith("\n"):
-            content = content[:-1]
-        files[fname] = content
+    files = parse_fenced_files(chunk)
     return {'hypothesis': hypothesis, 'expected_effect': expected_effect,
             'lever_category': lever_category, 'sweep_param': sweep_param,
             'sweep_values': sweep_values, 'files': files}
@@ -1007,39 +1232,41 @@ def _parse_sweep_values(raw):
 
 def parse_response(text):
     """Returns a dict: {'reflection', 'hypothesis', 'expected_effect', 'probe_question',
-    'research_question', 'explore_question', 'sweep_param', 'sweep_values', 'mode',
-    'files', 'variants'}.
+    'research_question', 'explore_question', 'eda_round_question',
+    'code_session_question', 'sweep_param', 'sweep_values', 'mode', 'files', 'variants'}.
     `mode` is 'parallel_hypothesis' if 2+ `VARIANT N:` blocks parsed with at least one
     pipeline file change each (checked FIRST, before the single-hypothesis check below --
     a multi-variant response's fenced blocks also get picked up by the top-level `files`
     scan, which would otherwise misclassify it as a plain 'hypothesis' turn); 'probe' if
     a probe.py file was produced and neither data.py nor baseline.py was (code-based
     detection, not text-label-based, so it's robust to the model accidentally leaving
-    stray HYPOTHESIS/PROBE_QUESTION/RESEARCH_QUESTION/EXPLORE_QUESTION text around);
-    'research' if no files at all were produced but a RESEARCH_QUESTION line parsed;
-    'explore' if no files and no research question but an EXPLORE_QUESTION line parsed
-    (checked after research, so a response accidentally containing both text labels
-    still resolves to research first -- matches this list's own presentation order);
-    otherwise 'hypothesis' (also the fallback for a malformed response with no files and
-    no research/explore question -- orchestrator.py's existing "no valid file changes
-    parsed" failure path already handles that case). For a 'parallel_hypothesis'
-    response, the top-level 'hypothesis'/'expected_effect'/'files' fields are NOT
-    meaningful (they'll contain a jumble of whichever variant's blocks the top-level scan
-    happened to see last) -- use 'variants' instead, a list of {'hypothesis',
-    'expected_effect', 'files'} dicts, one per variant. `sweep_param` is '' and
-    `sweep_values` is [] unless both SWEEP_PARAM and at least one valid numeric
-    SWEEP_VALUES entry were present -- a sweep is only ever opt-in, so a normal
-    hypothesis turn (the vast majority) is unaffected by this parsing. Every field
-    defaults to '' / {} / [] when absent — expected for a repair call (no
-    REFLECTION/HYPOTHESIS/EXPECTED_EFFECT/PROBE_QUESTION/RESEARCH_QUESTION/
-    EXPLORE_QUESTION/VARIANT needed there) or a first-ever iteration."""
-    files = {}
-    for m in _FENCE_RE.finditer(text):
-        fname = m.group(1).strip()
-        content = m.group(2)
-        if content.endswith("\n"):
-            content = content[:-1]
-        files[fname] = content
+    stray HYPOTHESIS/PROBE_QUESTION/RESEARCH_QUESTION/EXPLORE_QUESTION/EDA_ROUND_REQUEST/
+    CODE_SESSION_REQUEST text around); 'research' if no files at all were produced but a
+    RESEARCH_QUESTION line parsed; 'explore' if no files and no research question but an
+    EXPLORE_QUESTION line parsed; 'eda_round' if none of the above but an
+    EDA_ROUND_REQUEST line parsed; 'code_session' if none of the above but a
+    CODE_SESSION_REQUEST line parsed (checked last among the four text-only questions, so
+    a response accidentally containing more than one text label still resolves in this
+    list's own presentation order -- research, then explore, then eda_round, then
+    code_session); otherwise 'hypothesis' (also the fallback for a malformed response with
+    no files and no question of any kind -- orchestrator.py's existing "no valid file
+    changes parsed" failure path already handles that case, AND the deliberate reuse this
+    function gets from agent/code_agent.py's own multi-turn session: its final text has no
+    fenced files and no question label either -- by design, since its file changes are
+    already applied via Edit/Write, not emitted as text -- so it falls to this same
+    'hypothesis' default, which is exactly the mode orchestrator.py's code_session branch
+    wants). For a 'parallel_hypothesis' response, the top-level
+    'hypothesis'/'expected_effect'/'files' fields are NOT meaningful (they'll contain a
+    jumble of whichever variant's blocks the top-level scan happened to see last) -- use
+    'variants' instead, a list of {'hypothesis', 'expected_effect', 'files'} dicts, one
+    per variant. `sweep_param` is '' and `sweep_values` is [] unless both SWEEP_PARAM and
+    at least one valid numeric SWEEP_VALUES entry were present -- a sweep is only ever
+    opt-in, so a normal hypothesis turn (the vast majority) is unaffected by this
+    parsing. Every field defaults to '' / {} / [] when absent — expected for a repair
+    call (no REFLECTION/HYPOTHESIS/EXPECTED_EFFECT/PROBE_QUESTION/RESEARCH_QUESTION/
+    EXPLORE_QUESTION/EDA_ROUND_REQUEST/CODE_SESSION_REQUEST/VARIANT needed there) or a
+    first-ever iteration."""
+    files = parse_fenced_files(text)
 
     reflection_match = _REFLECTION_RE.search(text)
     reflection = reflection_match.group(1).strip() if reflection_match else ""
@@ -1064,6 +1291,10 @@ def parse_response(text):
     research_question = rq_match.group(1).strip() if rq_match else ""
     eq_match = _EXPLORE_QUESTION_RE.search(text)
     explore_question = eq_match.group(1).strip() if eq_match else ""
+    erq_match = _EDA_ROUND_REQUEST_RE.search(text)
+    eda_round_question = erq_match.group(1).strip() if erq_match else ""
+    csq_match = _CODE_SESSION_REQUEST_RE.search(text)
+    code_session_question = csq_match.group(1).strip() if csq_match else ""
 
     variants = []
     variant_chunks = _split_variants(text)
@@ -1085,11 +1316,16 @@ def parse_response(text):
         mode = 'research'
     elif explore_question:
         mode = 'explore'
+    elif eda_round_question:
+        mode = 'eda_round'
+    elif code_session_question:
+        mode = 'code_session'
     else:
         mode = 'hypothesis'
 
     return {'reflection': reflection, 'hypothesis': hypothesis, 'expected_effect': expected_effect,
             'lever_category': lever_category, 'probe_question': probe_question,
             'research_question': research_question, 'explore_question': explore_question,
+            'eda_round_question': eda_round_question, 'code_session_question': code_session_question,
             'sweep_param': sweep_param, 'sweep_values': sweep_values, 'mode': mode,
             'files': files, 'variants': variants}

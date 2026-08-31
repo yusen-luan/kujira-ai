@@ -289,16 +289,22 @@ receives before it proposes a feature-engineering or model-architecture change -
 concise (tight bullet points, no filler, no restating numbers that aren't actionable) and focused \
 on facts that should change what the agent tries next. Organize under these exact headers, in \
 this order: `## Label & class balance`, `## Popularity & cold-start`, `## Data quality issues`, \
-`## Leakage risk`, `## Distribution shift`, `## Unused data available`. Under Leakage risk, \
-explicitly list which raw log columns must never be used as same-row input features and state \
-why in one sentence. Under Unused data available, name the side-info files/columns the pipeline \
-doesn't currently read and one concrete way each could be used. Keep the whole thing under ~45 \
-lines of markdown. Output only the markdown, nothing else."""
+`## Leakage risk`, `## Distribution shift`, `## Unused data available`, `## Agent's own follow-up \
+investigations`. Under Leakage risk, explicitly list which raw log columns must never be used as \
+same-row input features and state why in one sentence. Under Unused data available, name the \
+side-info files/columns the pipeline doesn't currently read and one concrete way each could be \
+used. Under Agent's own follow-up investigations, distill any findings given to you below from \
+the agentic-EDA loop's own probes into a few bullets (or write exactly "(none this run)" if none \
+were given). Keep the whole thing under ~50 lines of markdown. Output only the markdown, nothing \
+else."""
 
 
-def summarize_with_llm(report, model, max_budget_usd):
+def summarize_with_llm(report, model, max_budget_usd, extra_context=''):
+    extra_block = (f"\n\nAdditional findings from the agent's own follow-up investigations "
+                    f"(across every agentic-EDA round run so far this project):\n{extra_context}\n"
+                    if extra_context else '')
     user_prompt = ("EDA report (JSON):\n```json\n" + json.dumps(report, indent=2) +
-                   "\n```\n\nWrite the summary now.")
+                   "\n```" + extra_block + "\n\nWrite the summary now.")
     attempt = llm_mod.call_claude(EDA_INTERPRET_SYSTEM_PROMPT, user_prompt,
                                    model=model, max_budget_usd=max_budget_usd)
     if not attempt['ok']:
@@ -307,7 +313,8 @@ def summarize_with_llm(report, model, max_budget_usd):
     return attempt['text'].strip()
 
 
-def run(data_dir, out_dir=RUNS_DIR, model='sonnet', max_budget_usd=0.50, skip_llm=False):
+def run(data_dir, out_dir=RUNS_DIR, model='sonnet', max_budget_usd=0.50, skip_llm=False,
+        agent_turns=3, agent_max_budget_usd=1.00, agent_max_repairs=2):
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -317,12 +324,32 @@ def run(data_dir, out_dir=RUNS_DIR, model='sonnet', max_budget_usd=0.50, skip_ll
     (out_dir / 'eda_report.json').write_text(json.dumps(report, indent=2), encoding='utf-8')
     print(f'  wrote {out_dir / "eda_report.json"}  ({time.time() - t0:.0f}s)')
 
+    extra_context = ''
+    if agent_turns > 0 and not skip_llm:
+        # Lazy: eda_agent.py imports this module (eda) at ITS top level (for the
+        # LOG_COLS/FEEDBACK_COLS/LEAKAGE_COLS schema text), so importing it eagerly at
+        # this file's top level would be a real load-time cycle. By the time this line
+        # runs, eda.py's own module object is already fully initialized in sys.modules,
+        # so this is safe -- see probe_runner.py's docstring for why the *other* half
+        # (the orchestrator-shared probe-execution helpers) had to move to a real leaf
+        # module instead of relying on import-order timing like this one does.
+        import eda_agent
+        print(f'  running agentic-EDA exploration (up to {agent_turns} turns, '
+              f'${agent_max_budget_usd:.2f} cap)...')
+        t0 = time.time()
+        eda_agent.run_agentic_exploration(
+            report, data_dir, model=model, max_turns=agent_turns,
+            max_budget_usd=agent_max_budget_usd, max_repairs=agent_max_repairs,
+            propose_timeout=300, probe_timeout=90, out_dir=out_dir)
+        extra_context = eda_agent.accumulated_findings_text(out_dir)
+        print(f'  agentic-EDA exploration done  ({time.time() - t0:.0f}s)')
+
     if skip_llm:
         summary = '(LLM summary skipped via --skip_llm; see eda_report.json for raw numbers.)'
     else:
         print('  summarizing via one LLM call...')
         t0 = time.time()
-        summary = summarize_with_llm(report, model, max_budget_usd)
+        summary = summarize_with_llm(report, model, max_budget_usd, extra_context=extra_context)
         print(f'  summarized  ({time.time() - t0:.0f}s)')
     (out_dir / 'eda_summary.md').write_text(summary, encoding='utf-8')
     print(f'  wrote {out_dir / "eda_summary.md"}')
@@ -336,5 +363,10 @@ if __name__ == '__main__':
     ap.add_argument('--model', default='sonnet')
     ap.add_argument('--max_budget_usd', type=float, default=0.50)
     ap.add_argument('--skip_llm', action='store_true')
+    ap.add_argument('--eda_agent_turns', type=int, default=3,
+                     help='max agentic-EDA exploration turns before finalizing the '
+                          'summary; 0 disables the loop entirely')
+    ap.add_argument('--eda_agent_max_budget_usd', type=float, default=1.00)
     a = ap.parse_args()
-    run(a.data_dir, a.out_dir, a.model, a.max_budget_usd, a.skip_llm)
+    run(a.data_dir, a.out_dir, a.model, a.max_budget_usd, a.skip_llm,
+        agent_turns=a.eda_agent_turns, agent_max_budget_usd=a.eda_agent_max_budget_usd)

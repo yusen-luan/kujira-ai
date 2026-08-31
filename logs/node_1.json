@@ -1,25 +1,26 @@
 {
   "iter": 1,
   "status": "rejected",
-  "hypothesis": "Add rich user profile/social-graph fields (user_active_degree, follow/fans/friend_user_num_range, register_days_range, cleaned is_live_streamer, is_video_author) from user_features_pure.csv as new categorical FM fields \u2014 per EDA's \"unused data available\" note, these are currently completely unjoined, and richer user-side signal should help personalization especially for the ~30-36% of users the current user_id-only embedding sees rarely, without touching the model or training loop.",
+  "hypothesis": "Join `user_features_pure.csv`'s `user_active_degree`, `follow_user_num_range`, `fan_user_num_range`, `register_days_range` as four new categorical fields in the FM (currently the model only sees raw `user_id`, which degrades to a shared UNK slot for the ~1.6-3.6% cold-start users noted in EDA and gives zero personalization signal beyond ID memorization for everyone else). These profile fields give the model transferable, generalizable user signal that isn't dependent on having seen that exact user_id in train.",
   "reflection": "",
-  "expected_effect": "GAUC should move more than nDCG@5, since these are per-user static features that primarily improve within-user ranking discrimination (the metric most sensitive to better personalization for sparse/cold users), while nDCG@5's top-of-list ranking is more item-popularity-driven and less affected by user-side features.",
+  "expected_effect": "GAUC improves more than nDCG@5, since these fields primarily help per-user ranking quality (especially for low-frequency/cold-start users) rather than top-5 ordering within a session.",
+  "lever_category": "feature_addition",
   "changed_files": [
     "data.py"
   ],
   "sweep": null,
   "metrics": {
     "valid": {
-      "GAUC": 0.6657776069980964,
-      "nDCG@5": 0.5355147935905044,
-      "primary": 0.6006462002943004,
+      "GAUC": 0.6680094491214087,
+      "nDCG@5": 0.5362685400199704,
+      "primary": 0.6021389945706895,
       "users": 22377,
       "rows": 124909
     },
     "test": {
-      "GAUC": 0.661596414556344,
-      "nDCG@5": 0.5286116833415957,
-      "primary": 0.5951040489489698,
+      "GAUC": 0.6619553835731602,
+      "nDCG@5": 0.5297966239945361,
+      "primary": 0.5958760037838482,
       "users": 23875,
       "rows": 170588
     }
@@ -41,21 +42,21 @@
     }
   },
   "training_curve": {
-    "n_epochs_logged": 8,
-    "first_epoch_primary": 0.5943,
-    "best_epoch": 4,
-    "best_epoch_primary": 0.6006,
-    "last_epoch": 8,
-    "last_epoch_primary": 0.5998,
+    "n_epochs_logged": 11,
+    "first_epoch_primary": 0.5939,
+    "best_epoch": 7,
+    "best_epoch_primary": 0.6021,
+    "last_epoch": 11,
+    "last_epoch_primary": 0.6,
     "early_stopped": true,
     "degraded_after_best": true,
     "still_improving_at_cutoff": false
   },
   "prev_best_primary": 0.6014687563529677,
-  "new_primary": 0.6006462002943004,
+  "new_primary": 0.6021389945706895,
   "llm_calls": [
     {
-      "cost_usd": 0.146809,
+      "cost_usd": 0.13633800000000001,
       "ok": true,
       "error": null
     }

@@ -39,24 +39,25 @@ State on disk:
     agent/runs/best/          current accepted data.py + baseline.py (single chain)
     agent/runs/node_N/        one node's working copy (kept after the run for inspection)
     agent/runs/probe_findings.md  accumulated diagnostic-probe results (deliverable-relevant)
+    agent/runs/eda_probes/    every agentic-EDA probe ever run (bootstrap + mid-run rounds)
     logs/node_N.json          full record of that node (deliverable #3)
 """
 import argparse
 import concurrent.futures
 import json
-import queue
 import re
 import shutil
 import subprocess
 import sys
-import threading
 import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import code_agent
 import display
 import eda
-import llm
+import eda_agent
+import probe_runner
 import prompt_templates as pt
 import rag
 import repo_explore
@@ -67,9 +68,66 @@ WORKSPACE = REPO_ROOT / 'workspace'
 RUNS_DIR = Path(__file__).resolve().parent / 'runs'
 LOGS_DIR = REPO_ROOT / 'logs'
 RUN_AND_REPORT = Path(__file__).resolve().parent / 'run_and_report.py'
-EDA_PROBE = Path(__file__).resolve().parent / 'eda_probe.py'
 PROBE_FINDINGS_PATH = RUNS_DIR / 'probe_findings.md'
 
+# v4 roadmap Phase 3b -- the only two packages prompt_templates.py's contract already tells the
+# LLM are sanctioned/expected in baseline.py ("No other new pip dependencies" is already the
+# rule), so this is exactly what's safe to auto-install unattended: nothing broader than what's
+# already contractually permitted.
+PIP_INSTALL_ALLOWLIST = ('torch', 'torchfm')
+
+
+def preflight_check(args):
+    """v4 roadmap Phase 3a, hardened: torch/torchfm are now a HARD requirement, not an optional
+    fallback. Node 9 (see agent_notes/v4_roadmap.md) crashed twice on
+    `ModuleNotFoundError: No module named 'torch'` -- torch was installed somewhere on the
+    machine but not in the exact interpreter agent/run_and_report.py's subprocess actually uses
+    (sys.executable). The original version of this function only detected that and fell back to
+    numpy-only for the whole run (adjusting the propose/repair prompt accordingly) -- but that
+    meant a torch-capable environment that simply never had `pip install torch torchfm` run in
+    THIS interpreter silently downgraded every run to numpy-only forever, capping the
+    model_architecture lever at what the LLM could hand-derive backprop for blind, in one shot,
+    with zero execution feedback -- a real, discovered-in-practice ceiling on run quality, not a
+    hypothetical one. Since PIP_INSTALL_ALLOWLIST above already exists specifically because
+    torch/torchfm are the only two packages the propose/repair contract sanctions, self-installing
+    them proactively here (before any LLM call, in the same interpreter run_and_report.py's
+    subprocess will use) is strictly narrower than what's already contractually permitted --
+    there's no reason to only self-heal reactively, on an in-flight crash, when we could just
+    ensure the precondition up front. Now unconditional: if the install itself fails (no network,
+    a broken index, disk space), preflight hard-fails the whole run rather than ever proceeding
+    numpy-only -- there is no more --require_torch opt-in, because there is no more optional path
+    to opt out of."""
+    display.phase('Preflight: checking torch/torchfm import in the run_and_report.py subprocess interpreter...')
+    proc = subprocess.run([sys.executable, '-c', 'import torch, torchfm'],
+                           capture_output=True, text=True, timeout=30)
+    if proc.returncode == 0:
+        args.torch_available = True
+        display.phase('Preflight: torch/torchfm import OK.')
+        return
+
+    diagnostic = (proc.stderr or '').strip().splitlines()[-1:] or ['(no stderr captured)']
+    display.phase(f'Preflight: torch/torchfm NOT importable in {sys.executable} -- {diagnostic[0]} -- '
+                  f'installing from the allowlist ({", ".join(PIP_INSTALL_ALLOWLIST)}) before proceeding, '
+                  f'since torch is now a hard requirement...')
+    for package in PIP_INSTALL_ALLOWLIST:
+        ok, output = pip_install(package)
+        display.phase(f'Preflight: pip install {package} -- {"OK" if ok else "FAILED"}')
+        if not ok:
+            print(f'FATAL: preflight install of {package!r} into {sys.executable} failed and torch is a '
+                  f'hard requirement -- no numpy-only fallback is available anymore.\n{output[-2000:]}\n'
+                  f'Fix manually: "{sys.executable}" -m pip install {" ".join(PIP_INSTALL_ALLOWLIST)}')
+            sys.exit(1)
+
+    proc = subprocess.run([sys.executable, '-c', 'import torch, torchfm'],
+                           capture_output=True, text=True, timeout=30)
+    if proc.returncode != 0:
+        diagnostic = (proc.stderr or '').strip().splitlines()[-1:] or ['(no stderr captured)']
+        print(f'FATAL: torch/torchfm still not importable in {sys.executable} after installing -- '
+              f'{diagnostic[0]}\n{proc.stderr[-2000:]}\n'
+              f'Fix manually: "{sys.executable}" -m pip install {" ".join(PIP_INSTALL_ALLOWLIST)}')
+        sys.exit(1)
+    args.torch_available = True
+    display.phase('Preflight: torch/torchfm installed and import OK.')
 
 
 def ensure_eda(args):
@@ -80,7 +138,10 @@ def ensure_eda(args):
     display.phase('EDA: computing data report (one-time, deterministic)...')
     t0 = time.time()
     eda.run(args.data_dir, model=args.model, max_budget_usd=args.max_budget_usd,
-            skip_llm=args.skip_eda_llm)
+            skip_llm=args.skip_eda_llm,
+            agent_turns=(0 if args.skip_eda_agent else args.eda_agent_turns),
+            agent_max_budget_usd=args.eda_agent_max_budget_usd,
+            agent_max_repairs=args.max_repairs)
     display.phase(f'EDA done in {time.time() - t0:.0f}s')
 
 
@@ -222,60 +283,6 @@ def apply_files(dir_path, files):
     return changed
 
 
-def _pump_stream(pipe, q):
-    """Background-thread target: pushes each line onto q, then a None sentinel once
-    the pipe closes (process exited). Lets the main thread poll with a timeout
-    instead of blocking forever on a hung, silent child process."""
-    try:
-        for line in iter(pipe.readline, ''):
-            q.put(line)
-    finally:
-        q.put(None)
-        pipe.close()
-
-
-def stream_subprocess(cmd, timeout):
-    """Runs cmd, streaming each stdout+stderr line live via display.run_line as it's
-    produced, and enforcing timeout with real wall-clock granularity (checked every
-    ~1s) even if the child produces no output at all. `-u` on the child's own
-    invocation (see callers) keeps Python's stdout line-buffered so lines actually
-    arrive as they're printed, not in bursts.
-    Returns (returncode_or_None, combined_output_text, timed_out: bool)."""
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                             text=True, encoding='utf-8', errors='replace', bufsize=1)
-    q = queue.Queue()
-    reader = threading.Thread(target=_pump_stream, args=(proc.stdout, q), daemon=True)
-    reader.start()
-
-    lines = []
-    deadline = time.time() + timeout
-    timed_out = False
-    while True:
-        remaining = deadline - time.time()
-        if remaining <= 0:
-            timed_out = True
-            break
-        try:
-            line = q.get(timeout=min(remaining, 1.0))
-        except queue.Empty:
-            continue
-        if line is None:
-            break
-        lines.append(line)
-        display.run_line(line.rstrip('\n'))
-
-    if timed_out:
-        proc.kill()
-        try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            pass
-        return None, ''.join(lines), True
-
-    proc.wait()
-    return proc.returncode, ''.join(lines), False
-
-
 _EPOCH_LINE_RE = re.compile(
     r"epoch\s*(\d+)\s*\|\s*loss\s*([\d.]+)\s*\|\s*valid GAUC\s*([\d.]+)\s*nDCG@5\s*([\d.]+)\s*primary\s*([\d.]+)")
 _EARLY_STOP_RE = re.compile(r"early stop at epoch\s*(\d+)")
@@ -319,7 +326,7 @@ def run_candidate(candidate_dir, data_dir, out_path, hparams, seed, timeout, ver
     ]
     if verbose:
         cmd.append('--verbose')
-    returncode, output, timed_out = stream_subprocess(cmd, timeout)
+    returncode, output, timed_out = probe_runner.stream_subprocess(cmd, timeout)
     if timed_out:
         return {'ok': False, 'timed_out': True, 'error': f'candidate run exceeded {timeout}s (likely a hang)'}
     if returncode != 0:
@@ -331,48 +338,6 @@ def run_candidate(candidate_dir, data_dir, out_path, hparams, seed, timeout, ver
     except json.JSONDecodeError:
         return {'ok': False, 'timed_out': False, 'error': 'metrics.json was not valid JSON'}
     return {'ok': True, 'metrics': metrics, 'training_curve': parse_training_curve(output)}
-
-
-def run_probe_candidate(probe_dir, data_dir, out_path, timeout):
-    """Runs a probe.py through agent/eda_probe.py's fixed harness. Same success/failure
-    contract as run_candidate above: exit 0 + valid JSON at --out = success."""
-    cmd = [sys.executable, '-u', str(EDA_PROBE),
-           '--probe_dir', str(probe_dir), '--data_dir', str(data_dir), '--out', str(out_path)]
-    returncode, output, timed_out = stream_subprocess(cmd, timeout)
-    if timed_out:
-        return {'ok': False, 'error': f'probe run exceeded {timeout}s (likely a hang)'}
-    if returncode != 0:
-        return {'ok': False, 'error': output[-4000:] or '(no output captured)'}
-    if not out_path.exists():
-        return {'ok': False, 'error': 'probe exited 0 but wrote no result JSON'}
-    try:
-        result = json.loads(out_path.read_text(encoding='utf-8'))
-    except json.JSONDecodeError:
-        return {'ok': False, 'error': 'probe result was not valid JSON'}
-    return {'ok': True, 'result': result}
-
-
-def call_llm_with_retry(system_prompt, user_prompt, model, max_budget_usd, label, retries=1,
-                         timeout=llm.DEFAULT_TIMEOUT_S):
-    """timeout defaults to llm.py's fixed 180s if not passed explicitly -- but every real
-    call site should pass args.propose_timeout, since the propose/repair prompt grows
-    with the run (more history, more literature notes, the lever-category taxonomy) and
-    a fixed 180s that was fine at node 1 can start timing out by node 14+ purely from
-    prompt size, not any actual problem with the call."""
-    t0 = display.llm_call_start(label)
-    attempt = llm.call_claude(system_prompt, user_prompt, model=model, max_budget_usd=max_budget_usd,
-                               timeout=timeout)
-    display.llm_call_end(t0, attempt)
-    tries = [attempt]
-    while not attempt['ok'] and retries > 0:
-        retries -= 1
-        display.retrying()
-        t0 = display.llm_call_start(label)
-        attempt = llm.call_claude(system_prompt, user_prompt, model=model, max_budget_usd=max_budget_usd,
-                                   timeout=timeout)
-        display.llm_call_end(t0, attempt)
-        tries.append(attempt)
-    return attempt, tries
 
 
 def write_log(node_id, record):
@@ -412,13 +377,13 @@ def load_prior_history():
                          prev_metrics=record.get('prev_metrics'), training_curve=record.get('training_curve'),
                          primary=record.get('new_primary'), prev_best=record.get('prev_best_primary'),
                          sweep=record.get('sweep'), variants=record.get('variants'),
-                         winning_variant=record.get('winning_variant'))
+                         winning_variant=record.get('winning_variant'), authored_via=record.get('authored_via'))
         elif status == 'answered':
             entry.update(question=record.get('question'), reflection=record.get('reflection'))
         elif status == 'failed':
             entry.update(hypothesis=record.get('hypothesis'), question=record.get('question'),
                          error_summary=record.get('error_summary'), lever_category=record.get('lever_category'),
-                         variants=record.get('variants'))
+                         variants=record.get('variants'), authored_via=record.get('authored_via'))
         elif status == 'researched':
             entry.update(research_question=record.get('research_question'),
                          reflection=record.get('reflection'),
@@ -427,10 +392,84 @@ def load_prior_history():
             entry.update(research_question=record.get('research_question'),
                          reflection=record.get('reflection'),
                          rejected_reason=record.get('rejected_reason'))
+        elif status == 'explored':
+            # Was missing before this fix -- explore-turn entries silently vanished from
+            # history across a --resume (the note itself still persisted via rag's
+            # corpus, but "History of past iterations" and the last-turn reflection
+            # check both lost the entry). Mirrors the researched/research_* handling above.
+            entry.update(explore_question=record.get('explore_question'),
+                         reflection=record.get('reflection'),
+                         note_title=(record.get('note') or {}).get('title'))
+        elif status in ('explore_failed', 'explore_denied'):
+            entry.update(explore_question=record.get('explore_question'),
+                         reflection=record.get('reflection'),
+                         rejected_reason=record.get('rejected_reason'))
+        elif status == 'eda_round':
+            entry.update(eda_round_question=record.get('eda_round_question'),
+                         reflection=record.get('reflection'))
+        elif status in ('eda_round_failed', 'eda_round_denied'):
+            entry.update(eda_round_question=record.get('eda_round_question'),
+                         reflection=record.get('reflection'))
+        elif status == 'code_session_denied':
+            # v4 roadmap Phase 4 -- mirrors research_denied/explore_denied/eda_round_denied
+            # above. A code session's ATTEMPTED outcome (accepted/rejected/failed) is already
+            # covered by the generic branches above (authored_via is what marks it as a code
+            # session, not the status string) -- only the denied-before-attempt case needs its
+            # own branch here.
+            entry.update(code_session_question=record.get('code_session_question'),
+                         reflection=record.get('reflection'))
         else:
             continue
         entries.append(entry)
     return entries, max_node
+
+
+_MODULE_NOT_FOUND_RE = re.compile(r"ModuleNotFoundError: No module named '([\w.]+)'")
+
+
+def _detect_missing_package(error_text):
+    """v4 roadmap Phase 3b. Scoped to exactly this one exception type/message shape (the
+    confirmed node 9 signature -- see logs/node_9.json's run_attempts[0].error) rather than a
+    broader ImportError catch-all: a generic ImportError (e.g. a version-mismatch `cannot import
+    name X`) isn't reliably fixed by reinstalling, and pip could even make it worse by silently
+    upgrading a pinned version. Returns the top-level installable package name (a submodule
+    failure like `torchfm.layer` maps to 'torchfm') or None."""
+    if not error_text:
+        return None
+    m = _MODULE_NOT_FOUND_RE.search(error_text)
+    return m.group(1).split('.')[0] if m else None
+
+
+_TORCH_CPU_INDEX = 'https://download.pytorch.org/whl/cpu'
+
+
+def pip_install(package, timeout=600):
+    """v4 roadmap Phase 3b -- installs into the exact same interpreter
+    agent/run_and_report.py's subprocess uses (sys.executable), which is precisely what would
+    have fixed node 9's actual root cause (torch present on the machine, absent from the right
+    interpreter). Only ever called with a name already checked against PIP_INSTALL_ALLOWLIST by
+    the caller. Reuses probe_runner.stream_subprocess for the same live-streamed-output + real
+    wall-clock timeout behavior run_candidate() itself relies on. Returns (ok, output).
+
+    Two environment-specific fixes discovered running preflight_check() for real (see its
+    docstring): (1) `--break-system-packages` -- Debian/Ubuntu system Pythons (PEP 668) refuse a
+    plain `pip install` outright with "externally-managed-environment", independent of whether
+    the package or network is fine; harmless to always pass since pip ignores it on interpreters
+    that aren't externally managed (a plain venv, Windows, etc.). (2) a plain `pip install torch`
+    resolves to the CUDA build by default, silently pulling several GB of nvidia-* wheels
+    (cublas/cudnn/nccl/...) that are dead weight here -- the contract in prompt_templates.py is
+    explicit that training must fit the wall-clock budget on CPU only, no GPU available -- so
+    `torch` specifically is pinned to PyPI's CPU-only wheel index; `torchfm` (pure Python, depends
+    on torch) still resolves from the default index and picks up the already-installed CPU torch
+    without re-resolving a different build. timeout bumped from 300s->600s since even the CPU-only
+    torch wheel alone is ~120MB and an unattended run shouldn't spuriously fail on a slower link."""
+    cmd = [sys.executable, '-m', 'pip', 'install', package, '--break-system-packages']
+    if package == 'torch':
+        cmd += ['--index-url', _TORCH_CPU_INDEX]
+    returncode, output, timed_out = probe_runner.stream_subprocess(cmd, timeout)
+    if timed_out:
+        return False, f'pip install {package} exceeded {timeout}s'
+    return returncode == 0, output
 
 
 def run_and_repair(node_id, iter_dir, hypothesis, args, llm_calls, hparams_override=None):
@@ -451,14 +490,40 @@ def run_and_repair(node_id, iter_dir, hypothesis, args, llm_calls, hparams_overr
     display.run_end(t0, result['ok'], timed_out=result.get('timed_out', False))
     run_attempts.append({'attempt': 0, 'ok': result['ok'], 'error': result.get('error')})
 
+    installed_packages = set()  # v4 roadmap Phase 3b -- never install the same allowlisted
+                                  # package twice in one node; bounds self-heal to at most
+                                  # len(PIP_INSTALL_ALLOWLIST) extra subprocess calls ever
     repairs_left = args.max_repairs
-    while not result['ok'] and repairs_left > 0:
+    while not result['ok']:
+        missing = _detect_missing_package(result['error'])
+        if missing and missing in PIP_INSTALL_ALLOWLIST and missing not in installed_packages:
+            installed_packages.add(missing)
+            display.phase(f'node {node_id}: detected missing allowlisted package {missing!r} in '
+                          f'the traceback -- installing into {sys.executable} and retrying the '
+                          f'same code unchanged (no LLM call, doesn\'t consume --max_repairs)...')
+            ok, output = pip_install(missing)
+            run_attempts.append({'attempt': len(run_attempts), 'action': 'pip_install',
+                                  'package': missing, 'ok': ok, 'output': output[-2000:]})
+            if ok:
+                display.run_start(f'candidate (node {node_id}, after installing {missing})', timeout)
+                t0 = time.time()
+                result = run_candidate(iter_dir, args.data_dir, metrics_path, hparams, args.seed, timeout,
+                                        verbose=not args.quiet)
+                display.run_end(t0, result['ok'], timed_out=result.get('timed_out', False))
+                run_attempts.append({'attempt': len(run_attempts), 'ok': result['ok'], 'error': result.get('error')})
+                continue  # re-check result['ok'] above -- doesn't consume repairs_left
+            # install itself failed (e.g. no network) -- fall through to the normal LLM-repair
+            # path below rather than giving up outright, same as any other unresolved failure;
+            # the LLM still gets a chance to rewrite around the missing dependency as usual.
+
+        if repairs_left <= 0:
+            break
         repairs_left -= 1
         repair_prompt = pt.build_repair_prompt(read_code(iter_dir), hypothesis, result['error'])
-        attempt, tries = call_llm_with_retry(pt.SYSTEM_PROMPT, repair_prompt, args.model, args.max_budget_usd,
-                                              label=f'repairing candidate after run failure '
-                                                    f'({repairs_left + 1} attempt(s) left)',
-                                              timeout=args.propose_timeout)
+        attempt, tries = probe_runner.call_llm_with_retry(
+            pt.build_system_prompt(args.torch_available), repair_prompt, args.model, args.max_budget_usd,
+            label=f'repairing candidate after run failure ({repairs_left + 1} attempt(s) left)',
+            timeout=args.propose_timeout)
         llm_calls.extend({'cost_usd': t.get('cost_usd'), 'ok': t['ok'], 'error': t.get('error')} for t in tries)
         if not attempt['ok']:
             run_attempts.append({'attempt': len(run_attempts), 'ok': False,
@@ -601,42 +666,6 @@ def run_variant_sweep(node_id, variant_dir, args, sweep_param, sweep_values, bas
     return best_result, best_value, trials
 
 
-def run_probe_and_repair(probe_dir, question, args, llm_calls):
-    """Same retry-with-traceback-feedback pattern as run_and_repair, pointed at a
-    probe.py instead of data.py/baseline.py. Returns (result, run_attempts)."""
-    result_path = probe_dir / 'probe_result.json'
-    run_attempts = []
-    display.run_start('diagnostic probe', args.probe_timeout)
-    t0 = time.time()
-    result = run_probe_candidate(probe_dir, args.data_dir, result_path, args.probe_timeout)
-    display.run_end(t0, result['ok'])
-    run_attempts.append({'attempt': 0, 'ok': result['ok'], 'error': result.get('error')})
-
-    repairs_left = args.max_repairs
-    while not result['ok'] and repairs_left > 0:
-        repairs_left -= 1
-        current_probe = {'probe.py': (probe_dir / 'probe.py').read_text(encoding='utf-8')}
-        repair_prompt = pt.build_repair_prompt(current_probe, question, result['error'])
-        attempt, tries = call_llm_with_retry(pt.SYSTEM_PROMPT, repair_prompt, args.model, args.max_budget_usd,
-                                              label=f'repairing probe after run failure ({repairs_left + 1} left)',
-                                              timeout=args.propose_timeout)
-        llm_calls.extend({'cost_usd': t.get('cost_usd'), 'ok': t['ok'], 'error': t.get('error')} for t in tries)
-        if not attempt['ok']:
-            run_attempts.append({'attempt': len(run_attempts), 'ok': False,
-                                  'error': f'repair LLM call failed: {attempt["error"]}'})
-            break
-        repaired_files = pt.parse_response(attempt['text'])['files']
-        for fname, content in repaired_files.items():
-            if fname in pt.PROBE_ALLOWED_FILES:
-                (probe_dir / fname).write_text(content, encoding='utf-8')
-        display.run_start('diagnostic probe (repaired)', args.probe_timeout)
-        t0 = time.time()
-        result = run_probe_candidate(probe_dir, args.data_dir, result_path, args.probe_timeout)
-        display.run_end(t0, result['ok'])
-        run_attempts.append({'attempt': len(run_attempts), 'ok': result['ok'], 'error': result.get('error')})
-    return result, run_attempts
-
-
 def append_probe_finding(node_id, question, result):
     PROBE_FINDINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
     block = f"### Probe (node {node_id})\nQuestion: {question}\n\n```json\n{json.dumps(result, indent=2)}\n```\n\n"
@@ -705,26 +734,89 @@ def best_alternate_candidate_code(history):
     return None, None
 
 
+def _finalize_hypothesis_node(node_id, iter_dir, hypothesis, expected_effect, lever_category,
+                               reflection, changed, best_dir, best_primary, prev_metrics, args,
+                               llm_calls, sweep_param=None, sweep_values=None, extra_record_fields=None):
+    """Shared tail of run_iteration()'s plain hypothesis-mode branch AND its code_session
+    branch (v4 roadmap Phase 4) -- runs the candidate already sitting in `iter_dir` (with an
+    optional hyperparameter sweep), accepts it into `best_dir` on improvement, writes the
+    log record, and returns the (status, new_best_primary, new_best_metrics, history_entry)
+    tuple run_iteration() itself returns. `changed` is the already-known list of touched
+    ALLOWED_FILES (computed differently by each caller -- from the parsed files dict for a
+    plain hypothesis turn, from a disk diff against the pre-session snapshot for a code
+    session -- but identical in meaning from here on). `extra_record_fields` (e.g.
+    {'authored_via': 'code_session', 'code_session_question': ...}) is merged into both the
+    on-disk log record and the returned history entry; None for the plain hypothesis path."""
+    extra = extra_record_fields or {}
+    sweep = None
+    if sweep_param:
+        result, best_value, trials, run_attempts = run_sweep(node_id, iter_dir, hypothesis, args, llm_calls,
+                                                               sweep_param, sweep_values)
+        sweep = {'param': sweep_param, 'trials': trials, 'best_value': best_value}
+    else:
+        result, run_attempts = run_and_repair(node_id, iter_dir, hypothesis, args, llm_calls)
+
+    if not result['ok']:
+        record = {'iter': node_id, 'status': 'failed', 'hypothesis': hypothesis,
+                   'reflection': reflection, 'expected_effect': expected_effect,
+                   'lever_category': lever_category, 'changed_files': changed,
+                   'sweep': sweep, 'error_summary': result['error'], 'llm_calls': llm_calls,
+                   'run_attempts': run_attempts, **extra}
+        write_log(node_id, record)
+        return 'failed', best_primary, prev_metrics, {'iter': node_id, 'status': 'failed',
+                                         'hypothesis': hypothesis, 'error_summary': result['error'], **extra}
+
+    new_primary = result['metrics']['valid']['primary']
+    if new_primary > best_primary + args.converge_eps:
+        for fname in pt.ALLOWED_FILES:
+            shutil.copy2(iter_dir / fname, best_dir / fname)
+        status, out_best, out_metrics = 'accepted', new_primary, result['metrics']
+    else:
+        status, out_best, out_metrics = 'rejected', best_primary, prev_metrics
+
+    record = {'iter': node_id, 'status': status, 'hypothesis': hypothesis,
+              'reflection': reflection, 'expected_effect': expected_effect,
+              'lever_category': lever_category, 'changed_files': changed,
+              'sweep': sweep, 'metrics': result['metrics'], 'prev_metrics': prev_metrics,
+              'training_curve': result.get('training_curve'),
+              'prev_best_primary': best_primary, 'new_primary': new_primary,
+              'llm_calls': llm_calls, 'run_attempts': run_attempts, **extra}
+    write_log(node_id, record)
+    return status, out_best, out_metrics, {'iter': node_id, 'status': status, 'hypothesis': hypothesis,
+                               'reflection': reflection, 'expected_effect': expected_effect,
+                               'lever_category': lever_category, 'sweep': sweep,
+                               'metrics': result['metrics'], 'prev_metrics': prev_metrics,
+                               'training_curve': result.get('training_curve'),
+                               'primary': new_primary, 'prev_best': best_primary, **extra}
+
+
 def run_iteration(node_id, best_dir, best_primary, prev_metrics, history, args, streak,
-                   web_research_remaining, explore_remaining):
+                   web_research_remaining, explore_remaining, eda_round_remaining,
+                   code_session_remaining):
     """One node of the single iteration chain. Proposes; the LLM itself picks a
-    hypothesis+code-change turn, a probe turn, a web-research turn, or a repo-explore
-    turn (budget permitting for the latter two). Accepts a hypothesis into `best_dir`
-    (in place) on improvement. Returns (status, new_best_primary, new_best_metrics,
-    history_entry). status is one of accepted/rejected/answered/failed/researched/
-    research_failed/research_denied/explored/explore_failed/explore_denied."""
+    hypothesis+code-change turn, a probe turn, a web-research turn, a repo-explore
+    turn, an EDA-round turn, or a code-session turn (budget permitting for the last
+    four). Accepts a hypothesis into `best_dir` (in place) on improvement. Returns
+    (status, new_best_primary, new_best_metrics, history_entry). status is one of
+    accepted/rejected/answered/failed/researched/research_failed/research_denied/
+    explored/explore_failed/explore_denied/eda_round/eda_round_failed/eda_round_denied/
+    code_session_denied (a code session's ATTEMPTED outcome reuses accepted/rejected/
+    failed rather than its own status family -- see _finalize_hypothesis_node -- marked
+    instead via the returned entry's 'authored_via': 'code_session' field)."""
     best_code = read_code(best_dir)
     alt_node_id, alt_code = best_alternate_candidate_code(history)
     propose_prompt = pt.build_propose_prompt(best_code, history, best_primary, streak,
                                               args.escalate_after, args.converge_eps,
                                               web_research_remaining=web_research_remaining,
                                               explore_remaining=explore_remaining,
+                                              eda_round_remaining=eda_round_remaining,
+                                              code_session_remaining=code_session_remaining,
                                               alt_node_id=alt_node_id, alt_code=alt_code)
     llm_calls = []
 
-    attempt, tries = call_llm_with_retry(pt.SYSTEM_PROMPT, propose_prompt, args.model, args.max_budget_usd,
-                                          label='deciding the next move (hypothesis or probe)',
-                                          timeout=args.propose_timeout)
+    attempt, tries = probe_runner.call_llm_with_retry(
+        pt.build_system_prompt(args.torch_available), propose_prompt, args.model, args.max_budget_usd,
+        label='deciding the next move (hypothesis or probe)', timeout=args.propose_timeout)
     llm_calls.extend({'cost_usd': t.get('cost_usd'), 'ok': t['ok'], 'error': t.get('error')} for t in tries)
     if not attempt['ok']:
         record = {'iter': node_id, 'status': 'failed', 'hypothesis': None,
@@ -754,7 +846,10 @@ def run_iteration(node_id, best_dir, best_primary, prev_metrics, history, args, 
         for fname, content in probe_files.items():
             (probe_dir / fname).write_text(content, encoding='utf-8')
 
-        result, run_attempts = run_probe_and_repair(probe_dir, question, args, llm_calls)
+        result, run_attempts = probe_runner.run_probe_and_repair(
+            probe_dir, question, args.data_dir, args.model, args.max_budget_usd,
+            args.propose_timeout, args.probe_timeout, args.max_repairs, llm_calls,
+            system_prompt=pt.build_system_prompt(args.torch_available), allowed_files=pt.PROBE_ALLOWED_FILES)
         if not result['ok']:
             record = {'iter': node_id, 'status': 'failed', 'question': question,
                        'error_summary': result['error'], 'llm_calls': llm_calls, 'run_attempts': run_attempts}
@@ -845,6 +940,111 @@ def run_iteration(node_id, best_dir, best_primary, prev_metrics, history, args, 
                 {'iter': node_id, 'status': 'explore_failed', 'explore_question': question,
                  'reflection': reflection})
 
+    if parsed['mode'] == 'eda_round':
+        question = parsed['eda_round_question']
+        display.field('eda round request', question)
+
+        if eda_round_remaining <= 0:
+            record = {'iter': node_id, 'status': 'eda_round_denied', 'eda_round_question': question,
+                       'reflection': reflection, 'llm_calls': llm_calls}
+            write_log(node_id, record)
+            return ('eda_round_denied', best_primary, prev_metrics,
+                    {'iter': node_id, 'status': 'eda_round_denied', 'eda_round_question': question,
+                     'reflection': reflection})
+
+        report = json.loads(eda.REPORT_PATH.read_text(encoding='utf-8'))
+        round_result = eda_agent.run_agentic_exploration(
+            report, args.data_dir, model=args.model, max_turns=args.eda_agent_turns,
+            max_budget_usd=args.eda_agent_max_budget_usd, max_repairs=args.max_repairs,
+            propose_timeout=args.propose_timeout, probe_timeout=args.probe_timeout,
+            out_dir=eda.RUNS_DIR, focus=question, context_note=reflection)
+        llm_calls.extend(c for t in round_result['new_turns'] for c in t.get('llm_calls', []))
+        run_attempts = [ra for t in round_result['new_turns'] for ra in t.get('run_attempts', [])]
+        n_new_probes = sum(1 for t in round_result['new_turns'] if t['mode'] == 'probe')
+
+        if n_new_probes > 0:
+            new_summary = eda.summarize_with_llm(
+                report, args.model, args.max_budget_usd,
+                extra_context=eda_agent.accumulated_findings_text(eda.RUNS_DIR))
+            eda.SUMMARY_PATH.write_text(new_summary, encoding='utf-8')
+            display.field('eda round result', f'{n_new_probes} new finding(s), eda_summary.md refreshed')
+            record = {'iter': node_id, 'status': 'eda_round', 'eda_round_question': question,
+                       'reflection': reflection, 'eda_round': round_result['round'],
+                       'stopped_reason': round_result['stopped_reason'],
+                       'llm_calls': llm_calls, 'run_attempts': run_attempts}
+            write_log(node_id, record)
+            return ('eda_round', best_primary, prev_metrics,
+                    {'iter': node_id, 'status': 'eda_round', 'eda_round_question': question,
+                     'reflection': reflection, 'n_new_probes': n_new_probes})
+
+        display.field('eda round result', f"no new findings ({round_result['stopped_reason']})")
+        record = {'iter': node_id, 'status': 'eda_round_failed', 'eda_round_question': question,
+                   'reflection': reflection, 'eda_round': round_result['round'],
+                   'stopped_reason': round_result['stopped_reason'],
+                   'llm_calls': llm_calls, 'run_attempts': run_attempts}
+        write_log(node_id, record)
+        return ('eda_round_failed', best_primary, prev_metrics,
+                {'iter': node_id, 'status': 'eda_round_failed', 'eda_round_question': question,
+                 'reflection': reflection})
+
+    if parsed['mode'] == 'code_session':
+        question = parsed['code_session_question']
+        display.field('code session request', question)
+
+        if code_session_remaining <= 0:
+            record = {'iter': node_id, 'status': 'code_session_denied', 'code_session_question': question,
+                       'reflection': reflection, 'llm_calls': llm_calls}
+            write_log(node_id, record)
+            return ('code_session_denied', best_primary, prev_metrics,
+                    {'iter': node_id, 'status': 'code_session_denied', 'code_session_question': question,
+                     'reflection': reflection})
+
+        iter_dir = snapshot_node_dir(node_id, best_dir)  # pre-populates data.py/baseline.py with
+                                                            # the current best -- best_code above is
+                                                            # this same content, used below to diff
+        session_result = code_agent.run_code_session(
+            iter_dir, best_code, history, question, model=args.model,
+            max_budget_usd=args.code_session_max_budget_usd, timeout=args.code_session_timeout,
+            torch_available=args.torch_available)
+        llm_calls.append({'cost_usd': session_result.get('cost_usd'), 'ok': session_result['ok'],
+                           'error': session_result.get('error')})
+
+        if not session_result['ok']:
+            error_summary = f"code session call failed: {session_result['error']}"
+            record = {'iter': node_id, 'status': 'failed', 'hypothesis': f'(code session) {question}',
+                       'reflection': reflection, 'error_summary': error_summary, 'llm_calls': llm_calls,
+                       'run_attempts': [], 'authored_via': 'code_session', 'code_session_question': question}
+            write_log(node_id, record)
+            return 'failed', best_primary, prev_metrics, {'iter': node_id, 'status': 'failed',
+                                             'hypothesis': f'(code session) {question}',
+                                             'error_summary': error_summary,
+                                             'authored_via': 'code_session'}
+
+        changed = [f for f in pt.ALLOWED_FILES
+                   if (iter_dir / f).read_text(encoding='utf-8') != best_code[f]]
+        if not changed:
+            record = {'iter': node_id, 'status': 'failed', 'hypothesis': f'(code session) {question}',
+                       'reflection': reflection, 'error_summary': 'code session made no changes to data.py/baseline.py',
+                       'raw_response': session_result['text'][:2000], 'llm_calls': llm_calls, 'run_attempts': [],
+                       'authored_via': 'code_session', 'code_session_question': question}
+            write_log(node_id, record)
+            return 'failed', best_primary, prev_metrics, {'iter': node_id, 'status': 'failed',
+                                             'hypothesis': f'(code session) {question}',
+                                             'error_summary': 'code session made no changes',
+                                             'authored_via': 'code_session'}
+
+        session_parsed = pt.parse_response(session_result['text'])
+        cs_hypothesis = session_parsed['hypothesis'] or f'(code session) {question}'
+        cs_expected_effect = session_parsed['expected_effect']
+        cs_lever_category = session_parsed['lever_category']
+        display.field('hypothesis', cs_hypothesis)
+        display.field('expected effect', cs_expected_effect)
+        display.field('lever category', cs_lever_category)
+        return _finalize_hypothesis_node(
+            node_id, iter_dir, cs_hypothesis, cs_expected_effect, cs_lever_category, reflection,
+            changed, best_dir, best_primary, prev_metrics, args, llm_calls,
+            extra_record_fields={'authored_via': 'code_session', 'code_session_question': question})
+
     if parsed['mode'] == 'parallel_hypothesis':
         variants = parsed['variants']
         display.field('parallel variants', '; '.join(
@@ -929,46 +1129,9 @@ def run_iteration(node_id, best_dir, best_primary, prev_metrics, history, args, 
 
     iter_dir = snapshot_node_dir(node_id, best_dir)
     apply_files(iter_dir, files)
-    sweep = None
-    if sweep_param:
-        result, best_value, trials, run_attempts = run_sweep(node_id, iter_dir, hypothesis, args, llm_calls,
-                                                               sweep_param, sweep_values)
-        sweep = {'param': sweep_param, 'trials': trials, 'best_value': best_value}
-    else:
-        result, run_attempts = run_and_repair(node_id, iter_dir, hypothesis, args, llm_calls)
-
-    if not result['ok']:
-        record = {'iter': node_id, 'status': 'failed', 'hypothesis': hypothesis,
-                   'reflection': reflection, 'expected_effect': expected_effect,
-                   'lever_category': lever_category, 'changed_files': changed,
-                   'sweep': sweep, 'error_summary': result['error'], 'llm_calls': llm_calls,
-                   'run_attempts': run_attempts}
-        write_log(node_id, record)
-        return 'failed', best_primary, prev_metrics, {'iter': node_id, 'status': 'failed',
-                                         'hypothesis': hypothesis, 'error_summary': result['error']}
-
-    new_primary = result['metrics']['valid']['primary']
-    if new_primary > best_primary + args.converge_eps:
-        for fname in pt.ALLOWED_FILES:
-            shutil.copy2(iter_dir / fname, best_dir / fname)
-        status, out_best, out_metrics = 'accepted', new_primary, result['metrics']
-    else:
-        status, out_best, out_metrics = 'rejected', best_primary, prev_metrics
-
-    record = {'iter': node_id, 'status': status, 'hypothesis': hypothesis,
-              'reflection': reflection, 'expected_effect': expected_effect,
-              'lever_category': lever_category, 'changed_files': changed,
-              'sweep': sweep, 'metrics': result['metrics'], 'prev_metrics': prev_metrics,
-              'training_curve': result.get('training_curve'),
-              'prev_best_primary': best_primary, 'new_primary': new_primary,
-              'llm_calls': llm_calls, 'run_attempts': run_attempts}
-    write_log(node_id, record)
-    return status, out_best, out_metrics, {'iter': node_id, 'status': status, 'hypothesis': hypothesis,
-                               'reflection': reflection, 'expected_effect': expected_effect,
-                               'lever_category': lever_category, 'sweep': sweep,
-                               'metrics': result['metrics'], 'prev_metrics': prev_metrics,
-                               'training_curve': result.get('training_curve'),
-                               'primary': new_primary, 'prev_best': best_primary}
+    return _finalize_hypothesis_node(node_id, iter_dir, hypothesis, expected_effect, lever_category,
+                                      reflection, changed, best_dir, best_primary, prev_metrics, args,
+                                      llm_calls, sweep_param=sweep_param, sweep_values=sweep_values)
 
 
 def main():
@@ -1012,6 +1175,36 @@ def main():
     ap.add_argument('--explore_timeout', type=int, default=90,
                      help='seconds before a repo-explore LLM call is killed (read-only local '
                           'Read/Grep/Glob, so shorter than the web-research default)')
+    ap.add_argument('--eda_round_budget', type=int, default=2,
+                     help='max mid-run agentic-EDA rounds the LLM may request for this run '
+                          '(separate pool from --iterations and the other budgets above) -- '
+                          '0 disables the EDA_ROUND_REQUEST option entirely')
+    ap.add_argument('--code_session_budget', type=int, default=2,
+                     help='max bounded multi-turn coding sessions (v4 roadmap Phase 4) the LLM '
+                          'may request for this run (separate pool from --iterations and the '
+                          'other budgets above) -- 0 disables the CODE_SESSION_REQUEST option '
+                          'entirely')
+    ap.add_argument('--code_session_max_budget_usd', type=float, default=1.00,
+                     help='cumulative $ ceiling for ONE coding session (all its internal tool-use '
+                          'turns combined, enforced by the claude CLI itself) -- separate from '
+                          '--max_budget_usd, which only caps a single plain propose/repair call')
+    ap.add_argument('--code_session_timeout', type=int, default=480,
+                     help='seconds before a coding session subprocess is killed -- longer than '
+                          '--propose_timeout since a multi-turn read/edit/verify session needs '
+                          'more wall-clock than one text completion')
+    ap.add_argument('--eda_agent_turns', type=int, default=3,
+                     help='max write-probe -> run -> see-result turns per agentic-EDA round '
+                          '(both the mandatory startup pass and every mid-run round) before '
+                          'finalizing; 0 disables the loop entirely, falling back to exactly '
+                          'the single pinned summarization call from before Phase 2')
+    ap.add_argument('--eda_agent_max_budget_usd', type=float, default=1.00,
+                     help='cumulative $ ceiling across one whole agentic-EDA round (all turns '
+                          '+ repairs combined) -- separate from --max_budget_usd, which only '
+                          'caps a single LLM call')
+    ap.add_argument('--skip_eda_agent', action='store_true',
+                     help='disable the agentic-EDA loop entirely -- both the mandatory startup '
+                          'pass (same as --eda_agent_turns 0) and the mid-run EDA_ROUND_REQUEST '
+                          'option (same as --eda_round_budget 0)')
     ap.add_argument('--converge_eps', type=float, default=0.002,
                      help='official convergence epsilon: stop early once no node improves the overall '
                           'best primary by more than this over --converge_n consecutive nodes')
@@ -1033,6 +1226,7 @@ def main():
     args = ap.parse_args()
     display.set_quiet(args.quiet)
 
+    preflight_check(args)
     ensure_eda(args)
     ensure_literature(args)
     if args.resume:
@@ -1060,7 +1254,8 @@ def main():
         write_log(0, {'iter': 0, 'status': 'failed', 'error_summary': result['error']})
         sys.exit(1)
     baseline_primary = result['metrics']['valid']['primary']
-    write_log(0, {'iter': 0, 'status': label, 'metrics': result['metrics']})
+    write_log(0, {'iter': 0, 'status': label, 'metrics': result['metrics'],
+                  'preflight': {'torch_available': args.torch_available, 'interpreter': sys.executable}})
     display.phase(f'{label} valid primary = {baseline_primary:.4f}')
 
     best_primary = baseline_primary
@@ -1076,6 +1271,8 @@ def main():
     web_research_remaining = args.web_research_budget  # a per-invocation budget, like plateau_streak,
                                                          # not reconstructed from prior sessions' spend
     explore_remaining = args.explore_budget  # same per-invocation-only accounting as web_research_remaining
+    eda_round_remaining = 0 if args.skip_eda_agent else args.eda_round_budget
+    code_session_remaining = args.code_session_budget  # same per-invocation-only accounting
     if history:
         display.phase(f'loaded {len(history)} prior iteration(s) from {LOGS_DIR} '
                        f'(plateau streak reset to 0); this run continues at node {node_id}')
@@ -1090,13 +1287,21 @@ def main():
         display.banner(f'node {node_id}')
         status, best_primary, best_metrics, entry = run_iteration(
             node_id, best_dir, best_primary, best_metrics, history, args, plateau_streak,
-            web_research_remaining, explore_remaining)
+            web_research_remaining, explore_remaining, eda_round_remaining, code_session_remaining)
         history.append(entry)
 
         if status in ('researched', 'research_failed'):
             web_research_remaining -= 1  # a denied request never spent a research call
         if status in ('explored', 'explore_failed'):
             explore_remaining -= 1  # a denied request never spent an explore call
+        if status in ('eda_round', 'eda_round_failed'):
+            eda_round_remaining -= 1  # a denied request never spent an eda-round
+        if entry.get('authored_via') == 'code_session' and status != 'code_session_denied':
+            # a code session's ATTEMPTED outcome reuses accepted/rejected/failed (see
+            # _finalize_hypothesis_node), unlike research/explore/eda_round whose own status
+            # strings already say "attempted" -- so the decrement check has to key off the
+            # 'authored_via' marker instead of the status string
+            code_session_remaining -= 1
 
         if status in ('accepted', 'rejected'):
             display.result_line(entry['status'], entry.get('hypothesis'), entry.get('primary'),
@@ -1107,6 +1312,10 @@ def main():
             display.research_line(status, entry.get('research_question'), entry.get('note_title'))
         elif status in ('explored', 'explore_failed', 'explore_denied'):
             display.explore_line(status, entry.get('explore_question'), entry.get('note_title'))
+        elif status in ('eda_round', 'eda_round_failed', 'eda_round_denied'):
+            display.eda_round_line(status, entry.get('eda_round_question'), entry.get('n_new_probes'))
+        elif status == 'code_session_denied':
+            display.code_session_line(status, entry.get('code_session_question'))
         elif entry.get('question') is not None:
             display.probe_line('failed', entry.get('question'))
         else:

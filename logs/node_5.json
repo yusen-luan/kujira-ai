@@ -1,97 +1,24 @@
 {
   "iter": 5,
-  "status": "rejected",
-  "hypothesis": "Expose the FM's L2 weight-decay strength as a tunable hparam (currently hardcoded at a near-zero 1e-6) and sweep it upward, since the BPR training curve's post-peak degradation is a textbook under-regularization signature \u2014 a stronger L2 penalty should let training run longer before the pairwise objective starts overfitting per-user idiosyncrasies, recovering some of the primary lost between epoch 6 and the early-stop point.",
-  "reflection": "BPR (iter 4) worked as predicted \u2014 GAUC gained 3x more than nDCG@5, confirming the pairwise objective targets GAUC's own definition \u2014 but the training curve shows a clear overfitting signature (peak at epoch 6, degraded by epoch 10), meaning the current L2 (hardcoded at 1e-6, effectively negligible) isn't restraining the pairwise objective from over-fitting user-specific noise as training continues.",
-  "expected_effect": "GAUC should move more than nDCG@5, since BPR's pairwise loss (and its overfitting) is concentrated on per-user ranking noise exactly like GAUC measures, whereas nDCG@5 already showed a smaller BPR-driven swing last iteration.",
-  "changed_files": [
-    "baseline.py"
-  ],
-  "sweep": {
-    "param": "l2",
-    "trials": [
-      {
-        "value": 1e-06,
-        "ok": true,
-        "primary": 0.6035388379045904,
-        "error": null
-      },
-      {
-        "value": 1e-05,
-        "ok": true,
-        "primary": 0.6033037833286994,
-        "error": null
-      },
-      {
-        "value": 0.0001,
-        "ok": true,
-        "primary": 0.6030771584322445,
-        "error": null
-      },
-      {
-        "value": 0.001,
-        "ok": true,
-        "primary": 0.5984836067928878,
-        "error": null
-      }
-    ],
-    "best_value": 1e-06
+  "status": "researched",
+  "research_question": "For implicit-feedback CTR/ranking models trained with pointwise BCE on data with strong item-popularity skew (Gini\u22480.79, top 1% of items driving ~24% of positives), what published technique \u2014 e.g., logit adjustment/prior correction at the output layer, inverse-propensity weighting, or popularity-aware negative/example weighting \u2014 most reliably improves per-user ranking metrics like GAUC/nDCG without requiring a randomized-exposure log, and how is it typically implemented at training time (the specific loss/logit modification, not just the high-level idea)?",
+  "reflection": "The pairwise-BPR training-procedure change (iter 4) underperformed pointwise BCE alone and showed a clear overfitting signature (peaked epoch 8, degraded to epoch 12), suggesting the issue wasn't the ranking objective itself being wrong but instability/overfitting in how it was combined with BCE \u2014 three straight code-guess iterations (feature, architecture, training-loss) have each moved primary by \u22640.003, which matches the plateau signal. Given the EDA's strongest unexploited signal is the severe item-popularity skew (Gini=0.79) and popularity_debiasing is a completely untried lever with zero literature retrieved so far, I should ground the next attempt in a real published technique rather than guess a fourth mechanism blind.",
+  "note": {
+    "title": "Logit Adjustment (prior correction) for long-tail/popularity-skewed pointwise classification",
+    "citation": "Menon, Jayasumana, Rawat, Jain, Veit & Kumar, 2021, ICLR (\"Long-tail learning via logit adjustment\")",
+    "tags": "logit adjustment, long-tail, popularity bias, class prior correction, BCE, pointwise CTR, GAUC, nDCG, no-propensity debiasing, recommendation ranking, sampled softmax logQ correction",
+    "source_url": "https://research.google/pubs/long-tail-learning-via-logit-adjustment/",
+    "body": "The most reliably reproduced fix for popularity-skewed pointwise training (no randomized-exposure log needed) is **logit adjustment**: shift each example's logit by a term derived only from the empirical label/item marginal frequency (a prior you can estimate directly from the training log itself), not from any propensity/exposure model. Two variants exist: (1) **loss-based** \u2014 during training, add \u03c4\u00b7log(\u03c0_y) to the raw logit before computing the (softmax or BCE) loss, so the model is forced to produce a larger margin for rare labels to compensate for the added positive offset on frequent ones; at inference the raw (unadjusted) logit is used directly for ranking, since the correction is already baked into the learned weights. (2) **post-hoc** \u2014 train normally, then at inference subtract \u03c4\u00b7log(\u03c0_y) from the logit before scoring/ranking. \u03c4\u22481 corresponds to the Bayes-optimal correction under a long-tail generalization of the softmax/logistic model; \u03c4<1 is used empirically when the plain prior over-corrects. For a pointwise BCE/CTR head this adapts naturally by treating \u03c0_i as each item's empirical positive-click marginal (frequency-based, not propensity-based) and applying a single scalar offset to the pre-sigmoid logit for that item during training loss computation only. Cost is negligible (one extra table lookup/add per example) and it requires no additional model capacity or exposure-randomization data \u2014 only stored item positive-frequency counts, which is exactly what's available in a KuaiRand-Pure-style Gini\u22480.79 log. A closely related, recsys-native version of the same mechanism is the \"logQ correction\" used for sampled-softmax two-tower models (Yi et al., RecSys 2019, Google \u2014 subtracting log of the sampling/popularity probability from the training logit and using raw dot-products at serving time); it is not the paper behind this note's source_url but is worth naming since it's the standard adaptation of logit adjustment specifically for large-scale candidate ranking/retrieval. In practice, teams report logit adjustment beats plain inverse-propensity weighting or negative up/down-weighting on per-user ranking metrics (GAUC/nDCG) in popularity-skewed pointwise setups because it directly targets the score calibration that ranking metrics are sensitive to, rather than reweighting gradients, and it degrades gracefully when the estimated prior is only approximate."
   },
-  "metrics": {
-    "valid": {
-      "GAUC": 0.6701663237546387,
-      "nDCG@5": 0.5369113520545421,
-      "primary": 0.6035388379045904,
-      "users": 22377,
-      "rows": 124909
-    },
-    "test": {
-      "GAUC": 0.6643671563121321,
-      "nDCG@5": 0.5306763487800008,
-      "primary": 0.5975217525460664,
-      "users": 23875,
-      "rows": 170588
-    }
-  },
-  "prev_metrics": {
-    "valid": {
-      "GAUC": 0.6701663237546387,
-      "nDCG@5": 0.5369113520545421,
-      "primary": 0.6035388379045904,
-      "users": 22377,
-      "rows": 124909
-    },
-    "test": {
-      "GAUC": 0.6643671563121321,
-      "nDCG@5": 0.5306763487800008,
-      "primary": 0.5975217525460664,
-      "users": 23875,
-      "rows": 170588
-    }
-  },
-  "training_curve": {
-    "n_epochs_logged": 10,
-    "first_epoch_primary": 0.594,
-    "best_epoch": 6,
-    "best_epoch_primary": 0.6035,
-    "last_epoch": 10,
-    "last_epoch_primary": 0.6022,
-    "early_stopped": true,
-    "degraded_after_best": true,
-    "still_improving_at_cutoff": false
-  },
-  "prev_best_primary": 0.6035388379045904,
-  "new_primary": 0.6035388379045904,
+  "saved_path": "/home/yusen-luan/tiktok_techjam_2026/agent/runs/web_literature/5_logit_adjustment_prior_correction_for_long_tail_popularity_s.md",
   "llm_calls": [
     {
-      "cost_usd": 0.1326974,
+      "cost_usd": 0.11229700000000001,
       "ok": true,
       "error": null
-    }
-  ],
-  "run_attempts": [
+    },
     {
-      "attempt": 0,
+      "cost_usd": 0.1093568,
       "ok": true,
       "error": null
     }

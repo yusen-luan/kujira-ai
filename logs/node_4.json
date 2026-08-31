@@ -1,90 +1,91 @@
 {
   "iter": 4,
-  "status": "accepted",
-  "hypothesis": "Replace the FM's pointwise BCE training objective with a BPR-style pairwise logistic loss \u2014 for each positive training row, sample one negative row from the *same user* (vectorized via precomputed per-user negative-index ranges, no python-level per-row loop, so it stays cheap), and train on -log(sigmoid(score_pos - score_neg)) instead of binary cross-entropy on individual rows. Per the literature note found via last iteration's web-research question (\"BPR Pairwise Loss for Optimizing GAUC/nDCG in Implicit-Feedback Ranking\"), this directly aligns the training signal with GAUC's actual definition (fraction of correctly-ordered pos/neg pairs per user) rather than optimizing an unrelated pointwise probability calibration objective.",
-  "reflection": "My last iteration used the web-research call and found that BPR-style pairwise loss is a well-established, practical fit for optimizing GAUC/nDCG-style rank metrics in an FM model without expensive per-user negative sampling (it can be done with vectorized in-batch/per-user negative sampling). Given I already have this specific, actionable finding in hand, spending another research call now would be wasteful \u2014 the higher-leverage move is to actually implement it, since it's a genuinely different mechanism (training objective) from the two failed feature-engineering attempts that caused the plateau, and it directly targets GAUC (which literally *is* a per-user pairwise-ranking accuracy metric) in a way pointwise BCE never explicitly optimizes for.",
-  "expected_effect": "GAUC should move more than nDCG@5, since BPR's pairwise objective is a near-exact training-time surrogate for per-user AUC (GAUC), whereas nDCG@5's within-user top-k emphasis is only indirectly helped by uniform pairwise ranking.",
+  "status": "rejected",
+  "hypothesis": "Add an auxiliary within-batch BPR-style pairwise ranking loss to DeepFM's training step \u2014 for each minibatch, sort rows by user id and pair adjacent same-user rows with differing labels, then add a `-log(sigmoid(z_pos - z_neg))` term (weighted by a new `pairwise_weight` hparam) on top of the existing pointwise BCE loss. GAUC is literally the average per-user probability that a positive outranks a negative, which is exactly what this within-user pairwise loss optimizes directly, whereas the current pointwise BCE only optimizes calibration, not relative within-user ordering. This is a training-procedure/negative-sampling change, not a feature or capacity change, and hasn't been tried yet (all three past iterations were either feature_addition or model_architecture).",
+  "reflection": "",
+  "expected_effect": "GAUC should improve more than nDCG@5, since GAUC is mathematically the same quantity (per-user pairwise ranking correctness) that the added BPR-style loss term directly optimizes, while nDCG@5's within-session top-5 ordering is a related but less directly targeted objective.",
+  "lever_category": "negative_sampling",
   "changed_files": [
     "baseline.py"
   ],
   "sweep": {
-    "param": "lr",
+    "param": "pairwise_weight",
     "trials": [
       {
-        "value": 0.001,
+        "value": 0,
         "ok": true,
-        "primary": 0.6035388379045904,
+        "primary": 0.604163073263061,
         "error": null
       },
       {
-        "value": 0.002,
+        "value": 0.3,
         "ok": true,
-        "primary": 0.6026950278295822,
+        "primary": 0.6036641366067566,
         "error": null
       },
       {
-        "value": 0.005,
+        "value": 0.6,
         "ok": true,
-        "primary": 0.5990362779399252,
+        "primary": 0.603060700077471,
         "error": null
       },
       {
-        "value": 0.01,
+        "value": 1,
         "ok": true,
-        "primary": 0.5978255961907225,
+        "primary": 0.6025600595358498,
         "error": null
       }
     ],
-    "best_value": 0.001
+    "best_value": 0
   },
   "metrics": {
     "valid": {
-      "GAUC": 0.6701663237546387,
-      "nDCG@5": 0.5369113520545421,
-      "primary": 0.6035388379045904,
+      "GAUC": 0.6709282634886421,
+      "nDCG@5": 0.5373978830374799,
+      "primary": 0.604163073263061,
       "users": 22377,
       "rows": 124909
     },
     "test": {
-      "GAUC": 0.6643671563121321,
-      "nDCG@5": 0.5306763487800008,
-      "primary": 0.5975217525460664,
+      "GAUC": 0.6650035920442896,
+      "nDCG@5": 0.5302681040441175,
+      "primary": 0.5976358480442036,
       "users": 23875,
       "rows": 170588
     }
   },
   "prev_metrics": {
     "valid": {
-      "GAUC": 0.6671326321610643,
-      "nDCG@5": 0.5358048805448711,
-      "primary": 0.6014687563529677,
+      "GAUC": 0.671286196795183,
+      "nDCG@5": 0.5376464611201756,
+      "primary": 0.6044663289576793,
       "users": 22377,
       "rows": 124909
     },
     "test": {
-      "GAUC": 0.6621228758829982,
-      "nDCG@5": 0.5285584577777603,
-      "primary": 0.5953406668303793,
+      "GAUC": 0.6643867142265109,
+      "nDCG@5": 0.5299183861567823,
+      "primary": 0.5971525501916466,
       "users": 23875,
       "rows": 170588
     }
   },
   "training_curve": {
-    "n_epochs_logged": 10,
-    "first_epoch_primary": 0.594,
-    "best_epoch": 6,
-    "best_epoch_primary": 0.6035,
-    "last_epoch": 10,
-    "last_epoch_primary": 0.6022,
+    "n_epochs_logged": 12,
+    "first_epoch_primary": 0.5994,
+    "best_epoch": 8,
+    "best_epoch_primary": 0.6042,
+    "last_epoch": 12,
+    "last_epoch_primary": 0.6028,
     "early_stopped": true,
     "degraded_after_best": true,
     "still_improving_at_cutoff": false
   },
-  "prev_best_primary": 0.6014687563529677,
-  "new_primary": 0.6035388379045904,
+  "prev_best_primary": 0.6044663289576793,
+  "new_primary": 0.604163073263061,
   "llm_calls": [
     {
-      "cost_usd": 0.2150164,
+      "cost_usd": 0.25273599999999996,
       "ok": true,
       "error": null
     }

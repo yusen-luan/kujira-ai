@@ -1,24 +1,69 @@
 {
   "iter": 3,
-  "status": "researched",
-  "research_question": "For implicit-feedback CTR/ranking models evaluated on GAUC (per-user AUC) and nDCG@k, is there a well-established pairwise or listwise ranking loss (e.g., BPR-style pairwise logistic loss sampled within each user's impressions, or a listwise softmax loss) that reliably outperforms plain pointwise binary cross-entropy for optimizing these specific rank-based metrics in a factorization-machine-style model, and is it practical to implement with only numpy/torch on CPU within a small per-epoch time budget (i.e., does it require expensive per-user negative sampling or can it be done efficiently in-batch)?",
-  "reflection": "Two feature-engineering attempts in a row (user profile fields, then a historical-rate field) both overfit and actively hurt GAUC on a plain-FM pointwise-BCE trainer \u2014 the mechanism (more sparse categorical fields \u2192 more noisy pairwise interactions, early-stopping doesn't fully rescue it) looks exhausted, and the plateau warning is right that another feature variant would likely repeat the same failure. Rather than guess a third feature, I want to check whether the training objective itself is mismatched with the eval metric before touching features again.",
-  "note": {
-    "title": "BPR Pairwise Loss for Optimizing GAUC/nDCG in Implicit-Feedback Ranking",
-    "citation": "Rendle, Freudenthaler, Gantner, Schmidt-Thieme, UAI 2009 (arXiv:1205.2618)",
-    "tags": "BPR, pairwise ranking loss, GAUC, per-user AUC, nDCG, implicit feedback, factorization machine, in-batch negative sampling, sampled softmax, pointwise BCE",
-    "source_url": "https://arxiv.org/abs/1205.2618",
-    "body": "Yes \u2014 Bayesian Personalized Ranking (BPR) is the well-established, widely-used pairwise loss for this exact setting: it directly maximizes the probability that an observed (positive) item is ranked above an unobserved (negative) item *for the same user*, which is mathematically the per-user pairwise comparison that GAUC measures, so BPR-style training tends to track GAUC/nDCG more faithfully than pointwise BCE, which only calibrates per-example probabilities and ignores within-user ordering. It is cheap: for each training step you sample one positive and one negative item from the *same user's* impressions (not global negative sampling), compute `score(pos) - score(neg)`, and apply `-log(sigmoid(diff))`; this is O(1) extra work per pair beyond a normal FM forward/backward pass and needs no expensive candidate retrieval, so it fits comfortably in a small numpy/torch CPU per-epoch budget. In-batch variants are also practical \u2014 you can build positive/negative pairs within a shuffled mini-batch grouped by user_id (vectorized via index masks in torch), avoiding any per-user Python loop. Caveats found in follow-up literature (not from the source_url, so not independently verified here beyond publisher attribution): the ACM TOIS paper \"On the Effectiveness of Sampled Softmax Loss for Item Recommendation\" (Wu et al., ACM TOIS 2023) reports sampled/in-batch softmax listwise losses can outperform BPR on some benchmarks but are more sensitive to the number of negatives; and the ACM RecSys 2023 paper on gSASRec (dl.acm.org) warns that naively using in-batch negatives with plain BCE causes overconfidence and metric degradation, which is why BPR's explicit pairwise formulation (or sampled-softmax) is generally preferred over BCE-with-in-batch-negatives. For a KuaiRand-Pure-style sparse, popularity-skewed short-video setting, sampling negatives *within the same user's impression list* (rather than globally) is especially important so popular items don't dominate the negative pool and bias the pairwise gradient."
+  "status": "rejected",
+  "hypothesis": "Add two aggregated-historical popularity features \u2014 a smoothed (Bayesian-shrunk) video positive-rate bucket and an author-level positive-rate bucket, both computed strictly from train-period rows only (never touching the row's own label) \u2014 as two new categorical fields in data.py. Per the EDA's popularity-skew finding (top 1% of videos drive ~24% of positives, Gini=0.79) this is high-value signal the model currently only gets indirectly through noisy per-video-id embeddings; giving it an explicit smoothed rate especially helps videos/authors with thin exposure history where the id embedding itself is undertrained.",
+  "reflection": "",
+  "expected_effect": "nDCG@5 should improve more than GAUC, since explicit popularity signal most directly sharpens the relative top-5 ordering of candidates within a user's session, whereas GAUC (per-user pairwise ranking averaged across the whole candidate pool) is less sensitive to this global-popularity signal.",
+  "lever_category": "feature_addition",
+  "changed_files": [
+    "data.py"
+  ],
+  "sweep": null,
+  "metrics": {
+    "valid": {
+      "GAUC": 0.6698747723549334,
+      "nDCG@5": 0.5369638864785568,
+      "primary": 0.6034193294167451,
+      "users": 22377,
+      "rows": 124909
+    },
+    "test": {
+      "GAUC": 0.6643625863428618,
+      "nDCG@5": 0.5309090352926505,
+      "primary": 0.5976358108177562,
+      "users": 23875,
+      "rows": 170588
+    }
   },
-  "saved_path": "/home/yusen-luan/tiktok_techjam_2026/agent/runs/web_literature/3_bpr_pairwise_loss_for_optimizing_gauc_ndcg_in_implicit_feedb.md",
+  "prev_metrics": {
+    "valid": {
+      "GAUC": 0.671286196795183,
+      "nDCG@5": 0.5376464611201756,
+      "primary": 0.6044663289576793,
+      "users": 22377,
+      "rows": 124909
+    },
+    "test": {
+      "GAUC": 0.6643867142265109,
+      "nDCG@5": 0.5299183861567823,
+      "primary": 0.5971525501916466,
+      "users": 23875,
+      "rows": 170588
+    }
+  },
+  "training_curve": {
+    "n_epochs_logged": 7,
+    "first_epoch_primary": 0.597,
+    "best_epoch": 3,
+    "best_epoch_primary": 0.6034,
+    "last_epoch": 7,
+    "last_epoch_primary": 0.6027,
+    "early_stopped": true,
+    "degraded_after_best": true,
+    "still_improving_at_cutoff": false
+  },
+  "prev_best_primary": 0.6044663289576793,
+  "new_primary": 0.6034193294167451,
   "llm_calls": [
     {
-      "cost_usd": 0.06993640000000001,
+      "cost_usd": 0.153703,
       "ok": true,
       "error": null
-    },
+    }
+  ],
+  "run_attempts": [
     {
-      "cost_usd": 0.12204340000000002,
+      "attempt": 0,
       "ok": true,
       "error": null
     }

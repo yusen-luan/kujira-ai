@@ -16,6 +16,22 @@ never be blurred by a careless call-site change:
   code-execution), confined to this repo's own root, for agent/repo_explore.py's
   read-only "what already exists in this project" role. Same non-actionable-output
   guarantee as the other two; see that module's docstring for the full rationale.
+- `call_claude_code()` — grants Read/Grep/Glob/Edit/Write (never Bash/PowerShell/REPL or
+  any other code-execution tool), confined via `cwd` to one candidate node directory
+  (never REPO_ROOT, never a data directory) — for agent/code_agent.py's bounded
+  multi-turn "read the pipeline, edit it in place" role (v4 roadmap Phase 4). This is the
+  only entry point whose output IS applied as code, but only ever via its own direct
+  Edit/Write tool calls inside that one confined directory, never via text parsed back
+  into a file — see that module's docstring. Deliberately excludes Bash: verified live
+  during Phase 4 planning that `--restricted`'s "confines file tools to the working
+  directory" guarantee is real for Read/Edit/Write (a cwd-confined session was refused on
+  a relative-path read one directory up) but does NOT extend to Bash (a restricted
+  session with Bash granted read a file outside its cwd via `cat ../...` without issue) --
+  Bash's reach is the OS user's full filesystem/network access regardless of cwd/
+  --add-dir/--restricted, which is fine for a human-supervised interactive session but not
+  for this orchestrator's unattended, multi-node runs. Every other role above already
+  omits Bash entirely for the same reason; this is the first role with Edit/Write, so it's
+  the first place that guarantee actually gets exercised.
 """
 import json
 import os
@@ -29,6 +45,9 @@ DEFAULT_MAX_BUDGET_USD = 0.50
 DEFAULT_TIMEOUT_S = 180
 DEFAULT_RESEARCH_TIMEOUT_S = 120
 DEFAULT_EXPLORE_TIMEOUT_S = 90
+DEFAULT_CODE_SESSION_TIMEOUT_S = 480  # a multi-turn read-edit-verify session needs materially
+                                       # more wall-clock than a single text completion or a
+                                       # one-or-two-turn research/explore lookup
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -161,3 +180,43 @@ def call_claude_explore(system_prompt, user_prompt, model=DEFAULT_MODEL,
     the propose/repair/probe path, which must stay on call_claude() above."""
     return _call_claude(['--restricted', '--tools', 'Read,Grep,Glob', '--allowedTools', 'Read,Grep,Glob'],
                          system_prompt, user_prompt, model, max_budget_usd, timeout, cwd=str(REPO_ROOT))
+
+
+def call_claude_code(system_prompt, user_prompt, cwd, model=DEFAULT_MODEL,
+                      max_budget_usd=DEFAULT_MAX_BUDGET_USD, timeout=DEFAULT_CODE_SESSION_TIMEOUT_S):
+    """Read/Grep/Glob/Edit/Write only -- NEVER Bash/PowerShell/REPL or any other
+    code-execution tool, ever (see module docstring for why -- verified live that
+    Bash's reach isn't actually bounded by --restricted/cwd the way the file tools
+    are). `cwd` is REQUIRED and must always be one candidate node directory (e.g.
+    agent/runs/node_N/) -- never REPO_ROOT and never a data directory -- since with no
+    Bash grant, cwd-confinement of these file tools IS the entire safety boundary this
+    role runs inside. The CLI runs its own internal multi-turn tool loop for this one
+    call (no hand-rolled turn driver needed, unlike agent/eda_agent.py's loop, which
+    exists only because call_claude() has zero tools to loop with) -- self-bounded by
+    max_budget_usd (a hard $ ceiling across every internal turn) and timeout (wall
+    clock, same subprocess-timeout pattern every other entry point here already uses).
+    Used only by agent/code_agent.py -- never by the propose/repair/probe path, which
+    must stay on call_claude() above."""
+    return _call_claude(['--restricted', '--tools', 'Read,Grep,Glob,Edit,Write',
+                          '--allowedTools', 'Read,Grep,Glob,Edit,Write'],
+                         system_prompt, user_prompt, model, max_budget_usd, timeout, cwd=cwd)
+
+
+class BudgetTracker:
+    """Cumulative-$ ceiling across multiple LLM calls in one role/session -- separate
+    from the per-call max_budget_usd above (which only bounds a single call's own
+    worst case). Checked BETWEEN calls in a loop, never used to cut a call short mid-
+    flight. First consumer: agent/eda_agent.py's agentic-EDA exploration loop, which can
+    run several turns (each its own LLM call plus possible repair calls); deliberately
+    generic (no EDA-specific knowledge) so later roles needing the same "don't let a
+    multi-turn loop run away on cost" guarantee reuse this instead of reinventing it."""
+
+    def __init__(self, ceiling_usd):
+        self.ceiling_usd = ceiling_usd
+        self.spent_usd = 0.0
+
+    def record(self, cost_usd):
+        self.spent_usd += cost_usd or 0.0
+
+    def exhausted(self):
+        return self.spent_usd >= self.ceiling_usd
